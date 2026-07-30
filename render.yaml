@@ -1,0 +1,80 @@
+# Render blueprint for the BuyDataNow API.
+#
+# Render → New → Blueprint → pick this repo. It reads this file from the repo
+# root and provisions the service below; the Next.js frontend is NOT included
+# (that goes to Vercel).
+#
+# Secrets are declared with `sync: false`, which means "this service needs the
+# variable, ask me for it in the dashboard" — the values are never committed.
+# Fill them in on first deploy: Render will prompt for each one.
+#
+# Deploy the API FIRST. Vercel bakes NEXT_PUBLIC_API_URL into the frontend at
+# build time, so the frontend build needs this service's URL to already exist.
+
+services:
+  - type: web
+    name: buydatanow-api
+    runtime: node
+    # No rootDir: this repo is the API itself, so the service builds from the
+    # repo root. (In the buydatanow monorepo this line read `rootDir: backend`.)
+    # Frankfurt is the closest region to Ghana. Others: oregon, ohio, virginia, singapore.
+    region: frankfurt
+    # `starter` stays awake. On `free` the instance sleeps after ~15 minutes
+    # idle, which stops the background poller — orders accepted by Rema as
+    # "pending" would then sit in `processing` until the next request wakes it.
+    plan: starter
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # The frontend origin. Drives CORS *and* the Paystack return URL, so a
+      # wrong value here sends paying customers to the wrong place.
+      # e.g. https://buydatanow.vercel.app  (no trailing slash)
+      - key: CLIENT_URL
+        sync: false
+
+      - key: MONGODB_URI
+        sync: false
+
+      # Generated once by Render and never stored in the repo. Recreating the
+      # service mints a new one, which signs everyone out — that is all.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
+
+      # Superadmin, provisioned on boot. Use a real password here — this account
+      # owns the /admin console.
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_NAME
+        value: Super Admin
+
+      # ⚠ Live payments — real cards are charged.
+      - key: PAYSTACK_MODE
+        value: live
+      - key: PAYSTACK_SECRET_KEY_LIVE
+        sync: false
+      - key: PAYSTACK_PUBLIC_KEY_LIVE
+        sync: false
+
+      # ⚠ Live fulfilment — every order spends the Rema wallet.
+      # `auto` resolves to ON here because NODE_ENV=production.
+      - key: REMA_MODE
+        value: live
+      - key: REMA_FULFILMENT
+        value: auto
+      - key: REMA_API_KEY_LIVE
+        sync: false
+      - key: REMA_POLL_SECONDS
+        value: "90"
+      # Never true on a database with real balances: it books wallet debits for
+      # bundles that were never sent.
+      - key: REMA_ALLOW_SIMULATED_SALES
+        value: "false"

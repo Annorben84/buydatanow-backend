@@ -1,0 +1,8 @@
+node_modules
+npm-debug.log*
+*.log
+
+# Secrets never belong in an image layer — they come from the runtime env.
+.env
+.env.*
+!.env.example
