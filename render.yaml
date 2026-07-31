@@ -34,6 +34,11 @@ services:
       # The frontend origin. Drives CORS *and* the Paystack return URL, so a
       # wrong value here sends paying customers to the wrong place.
       # e.g. https://buydatanow.vercel.app  (no trailing slash)
+      #
+      # Comma-separate to allow several origins. Every entry is accepted for
+      # CORS, but only the FIRST becomes the Paystack return URL, so the real
+      # frontend has to lead:
+      #   https://buydatanow.vercel.app,http://localhost:3000
       - key: CLIENT_URL
         sync: false
 
