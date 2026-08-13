@@ -79,6 +79,10 @@ export async function settleVerifiedPayment(reference, gatewayData) {
       return { action: "existing", paymentId: intent._id, agentId: current?.agent, orderId: current?.order };
     }
 
+    const feeRecovery = money(
+      Number(claimed.chargedAmount ?? claimed.amount) - Number(claimed.amount)
+    );
+
     if (claimed.purpose === "wallet_topup") {
       const agent = await Agent.findByIdAndUpdate(
         claimed.agent,
@@ -105,18 +109,32 @@ export async function settleVerifiedPayment(reference, gatewayData) {
         ],
         { session }
       );
-      if (claimed.gatewayFee > 0) {
+      if (feeRecovery !== 0 || claimed.gatewayFee > 0) {
         const superadmin = await Agent.findOne({ role: "superadmin" })
           .sort({ createdAt: 1 })
           .session(session);
         if (superadmin) {
+          const gatewayNet = money(feeRecovery - claimed.gatewayFee);
           await Agent.updateOne(
             { _id: superadmin._id },
-            { $inc: { wallet: -claimed.gatewayFee } },
+            { $inc: { wallet: gatewayNet } },
             { session }
           );
-          await Transaction.create(
-            [
+          const gatewayRows = [];
+          if (feeRecovery > 0) {
+            gatewayRows.push(
+              {
+                agentId: superadmin._id,
+                agent: superadmin.name,
+                type: "fee",
+                description: "Paystack fee paid by customer · wallet top-up",
+                amount: feeRecovery,
+                reference: `${claimed.reference}-paystack-fee-recovery`,
+              }
+            );
+          }
+          if (claimed.gatewayFee > 0) {
+            gatewayRows.push(
               {
                 agentId: superadmin._id,
                 agent: superadmin.name,
@@ -124,10 +142,10 @@ export async function settleVerifiedPayment(reference, gatewayData) {
                 description: "Paystack fee · wallet top-up",
                 amount: -claimed.gatewayFee,
                 reference: `${claimed.reference}-paystack-fee`,
-              },
-            ],
-            { session }
-          );
+              }
+            );
+          }
+          if (gatewayRows.length) await Transaction.create(gatewayRows, { session });
         }
       }
       claimed.status = "succeeded";
@@ -170,7 +188,9 @@ export async function settleVerifiedPayment(reference, gatewayData) {
             agent: agent._id,
             agentName: agent.name,
             agentWalletAdjustment: money(-claimed.agentMargin),
-            platformWalletAdjustment: superadmin ? money(-claimed.platformMargin) : 0,
+            platformWalletAdjustment: superadmin
+              ? money(-(claimed.platformMargin + feeRecovery - claimed.gatewayFee))
+              : 0,
             storeId: store._id,
           },
         },
@@ -212,7 +232,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
     }
 
     if (superadmin) {
-      const platformNet = money(claimed.platformMargin - claimed.gatewayFee);
+      const platformNet = money(claimed.platformMargin + feeRecovery - claimed.gatewayFee);
       if (platformNet !== 0) {
         await Agent.updateOne(
           { _id: superadmin._id },
@@ -231,6 +251,22 @@ export async function settleVerifiedPayment(reference, gatewayData) {
               description: `Platform margin · ${store.name} · ${claimed.network} ${claimed.gb}GB`,
               amount: claimed.platformMargin,
               reference: `${claimed.reference}-platform`,
+            },
+          ],
+          { session }
+        );
+      }
+      if (feeRecovery > 0) {
+        await Transaction.create(
+          [
+            {
+              agentId: superadmin._id,
+              agent: superadmin.name,
+              store: store.name,
+              type: "fee",
+              description: `Paystack fee paid by customer · ${store.name} · ${claimed.network} ${claimed.gb}GB`,
+              amount: feeRecovery,
+              reference: `${claimed.reference}-paystack-fee-recovery`,
             },
           ],
           { session }

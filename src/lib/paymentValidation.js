@@ -9,7 +9,7 @@ export function paymentMismatch(intent, data) {
   if (!data || data.status !== "success") return "Paystack has not confirmed a successful payment.";
   if (asText(data.reference) !== asText(intent.reference)) return "Payment reference mismatch.";
 
-  const expectedSubunit = Math.round(Number(intent.amount) * 100);
+  const expectedSubunit = Math.round(Number(intent.chargedAmount ?? intent.amount) * 100);
   if (!Number.isSafeInteger(Number(data.amount)) || Number(data.amount) !== expectedSubunit) {
     return "Payment amount mismatch.";
   }

@@ -30,7 +30,11 @@ const PaymentSchema = new Schema(
       default: "initialized",
       index: true,
     },
+    // `amount` is the product/top-up principal. `chargedAmount` includes the
+    // customer-paid Paystack fee and is what gateway verification must match.
     amount: { type: Number, required: true },
+    chargedAmount: { type: Number },
+    customerFee: { type: Number, default: 0 },
     currency: { type: String, default: "GHS" },
     email: { type: String, default: "" },
     agent: { type: Schema.Types.ObjectId, ref: "Agent", required: true, index: true },

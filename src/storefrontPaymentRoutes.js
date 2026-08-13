@@ -3,6 +3,7 @@ import { Router } from "express";
 
 import { Agent, AgentPrice, Bundle, Payment, Store } from "./models/index.js";
 import { clientOrigin, paystack, paystackConfigured } from "./lib/paystackApi.js";
+import { customerPaystackCharge, paystackFeePercent } from "./lib/paystackFee.js";
 import {
   PaymentSettlementError,
   settleVerifiedPayment,
@@ -78,11 +79,16 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
     const platformMargin = money(Math.max(0, platformPrice - providerCost));
     const email = String(req.body.email || "").trim() || owner.email || "orders@buydatanow.store";
     const reference = `DP-${randomUUID()}`;
+    const charge = customerPaystackCharge(amount);
+    const chargedAmount = money(charge.totalSubunit / 100);
+    const customerFee = money(charge.feeSubunit / 100);
 
     const intent = await Payment.create({
       reference,
       purpose: "storefront_order",
       amount,
+      chargedAmount,
+      customerFee,
       currency: "GHS",
       email,
       agent: owner._id,
@@ -101,7 +107,7 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
       method: "POST",
       body: JSON.stringify({
         email,
-        amount: Math.round(amount * 100),
+        amount: charge.totalSubunit,
         currency: "GHS",
         reference,
         callback_url: `${clientOrigin()}/store/${store.slug}`,
@@ -128,6 +134,9 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
         authorization_url: json.data.authorization_url,
         reference,
         amount,
+        fee: customerFee,
+        chargedAmount,
+        feePercent: paystackFeePercent(),
       },
     });
   } catch (err) {

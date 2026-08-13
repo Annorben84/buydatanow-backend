@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { paymentMismatch } from "../src/lib/paymentValidation.js";
+import { customerPaystackCharge } from "../src/lib/paystackFee.js";
 import { mapProviderStatus, normalizePhone, validPhone } from "../src/lib/remaApi.js";
 
 const walletIntent = {
@@ -23,6 +24,25 @@ const walletPayment = {
 
 test("accepts a Paystack payment only when it exactly matches the wallet intent", () => {
   assert.equal(paymentMismatch(walletIntent, walletPayment), "");
+});
+
+test("grosses up Ghana payments so the customer covers Paystack's fee", () => {
+  assert.deepEqual(customerPaystackCharge(4.7), {
+    principalSubunit: 470,
+    feeSubunit: 9,
+    totalSubunit: 479,
+  });
+  assert.deepEqual(customerPaystackCharge(50), {
+    principalSubunit: 5000,
+    feeSubunit: 99,
+    totalSubunit: 5099,
+  });
+});
+
+test("validates the customer-paid total while preserving the principal", () => {
+  const intent = { ...walletIntent, chargedAmount: 50.99, customerFee: 0.99 };
+  assert.equal(paymentMismatch(intent, { ...walletPayment, amount: 5099 }), "");
+  assert.match(paymentMismatch(intent, walletPayment), /amount/i);
 });
 
 test("rejects forged or changed Paystack settlement fields", () => {

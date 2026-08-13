@@ -15,8 +15,7 @@ services:
   - type: web
     name: buydatanow-api
     runtime: node
-    # No rootDir: this repo is the API itself, so the service builds from the
-    # repo root. (In the buydatanow monorepo this line read `rootDir: backend`.)
+    # No rootDir: this repository contains only the API.
     # Frankfurt is the closest region to Ghana. Others: oregon, ohio, virginia, singapore.
     region: frankfurt
     # `starter` stays awake. On `free` the instance sleeps after ~15 minutes
@@ -68,6 +67,8 @@ services:
         sync: false
       - key: PAYSTACK_PUBLIC_KEY_LIVE
         sync: false
+      - key: PAYSTACK_FEE_PERCENT
+        value: "1.95"
 
       # ⚠ Live fulfilment — every order spends the Rema wallet.
       # Explicitly enabled: every paid order is sent to Rema and spends the

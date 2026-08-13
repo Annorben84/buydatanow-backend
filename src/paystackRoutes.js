@@ -4,6 +4,7 @@ import { Router } from "express";
 import { Payment } from "./models/index.js";
 import { requireAuth } from "./lib/auth.js";
 import { paystack, paystackConfigured, clientOrigin } from "./lib/paystackApi.js";
+import { customerPaystackCharge, paystackFeePercent } from "./lib/paystackFee.js";
 import {
   PaymentSettlementError,
   settleVerifiedPayment,
@@ -32,10 +33,15 @@ router.post("/init", async (req, res, next) => {
     }
 
     const reference = `DP-${randomUUID()}`;
+    const charge = customerPaystackCharge(amount);
+    const chargedAmount = money(charge.totalSubunit / 100);
+    const customerFee = money(charge.feeSubunit / 100);
     const intent = await Payment.create({
       reference,
       purpose: "wallet_topup",
       amount,
+      chargedAmount,
+      customerFee,
       currency: "GHS",
       email: req.agent.email,
       agent: req.agent._id,
@@ -45,7 +51,7 @@ router.post("/init", async (req, res, next) => {
       method: "POST",
       body: JSON.stringify({
         email: req.agent.email,
-        amount: Math.round(amount * 100),
+        amount: charge.totalSubunit,
         currency: "GHS",
         reference,
         callback_url: `${clientOrigin()}/agent/add-fund`,
@@ -68,6 +74,10 @@ router.post("/init", async (req, res, next) => {
         authorization_url: json.data.authorization_url,
         reference,
         access_code: json.data.access_code,
+        amount,
+        fee: customerFee,
+        chargedAmount,
+        feePercent: paystackFeePercent(),
       },
     });
   } catch (err) {

@@ -15,7 +15,7 @@ export async function requestPaystackRefundForPayment(payment, reason) {
     method: "POST",
     body: JSON.stringify({
       transaction: payment.reference,
-      amount: Math.round(Number(payment.amount) * 100),
+      amount: Math.round(Number(payment.chargedAmount ?? payment.amount) * 100),
       currency: payment.currency || "GHS",
       customer_note: "This payment could not be safely matched to your checkout.",
       merchant_note: `Automatic refund: ${reason}`,
@@ -81,7 +81,7 @@ export async function requestPaystackRefundForOrder(order, reason = "Data order 
     method: "POST",
     body: JSON.stringify({
       transaction: order.paymentReference,
-      amount: Math.round(Number(order.amount) * 100),
+      amount: Math.round(Number(payment.chargedAmount ?? payment.amount) * 100),
       currency: "GHS",
       customer_note: "Your data order could not be delivered.",
       merchant_note: `Automatic refund for undelivered order ${order.ref}`,
@@ -129,7 +129,7 @@ export async function requestPaystackRefundForOrder(order, reason = "Data order 
       { $set: { status: completed ? "refunded" : "refund_pending" } }
     ),
   ]);
-  recordLog("warning", `Paystack refund queued · ${order.ref} · ₵${order.amount}`, "payments/refunds", {
+  recordLog("warning", `Paystack refund queued · ${order.ref} · ₵${payment.chargedAmount ?? payment.amount}`, "payments/refunds", {
     refundId: refund.id,
     status: providerStatus,
   });
