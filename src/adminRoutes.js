@@ -18,6 +18,7 @@ import { recordLog } from "./lib/audit.js";
 import { crud } from "./lib/crud.js";
 import { getSettings } from "./lib/settings.js";
 import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
+import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import {
   remaCatalog,
   remaConfigured,
@@ -718,7 +719,14 @@ router.post("/orders/:ref/reverse", async (req, res, next) => {
     }
 
     const { credit, platformClawback } = order.reversal;
+    const agentAdjustment = Number.isFinite(order.reversal.agentWalletAdjustment)
+      ? order.reversal.agentWalletAdjustment
+      : credit;
+    const platformAdjustment = Number.isFinite(order.reversal.platformWalletAdjustment)
+      ? order.reversal.platformWalletAdjustment
+      : -platformClawback;
     await reverseOrder(order);
+    const settled = await Order.findById(order._id).lean();
 
     recordLog(
       "warning",
@@ -728,12 +736,39 @@ router.post("/orders/:ref/reverse", async (req, res, next) => {
     res.json({
       data: {
         ref: order.ref,
-        status: order.status,
-        reversedAt: order.reversedAt,
-        credited: credit,
-        clawedBack: platformClawback,
+        status: settled?.status,
+        reversedAt: settled?.reversedAt,
+        agentWalletAdjustment: agentAdjustment,
+        platformWalletAdjustment: platformAdjustment,
       },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Retry a definitively failed Paystack refund after the cause is corrected. */
+router.post("/orders/:ref/refund", async (req, res, next) => {
+  try {
+    const order = await Order.findOne({ ref: req.params.ref });
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (!order.paymentReference) {
+      return res.status(409).json({ error: "This order was not paid through Paystack." });
+    }
+    if (!order.reversedAt) {
+      return res.status(409).json({ error: "Reverse the undelivered order before refunding it." });
+    }
+    if (["requesting", "pending", "processing", "processed", "unknown"].includes(order.refund?.status)) {
+      return res.status(409).json({
+        error: `Refund status is ${order.refund.status}; reconcile it in Paystack before retrying.`,
+      });
+    }
+
+    const result = await requestPaystackRefundForOrder(
+      order,
+      String(req.body?.reason || order.providerMessage || "Data order was not delivered")
+    );
+    res.json({ data: result });
   } catch (err) {
     next(err);
   }

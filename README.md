@@ -52,6 +52,10 @@ API runs on `http://localhost:5000`. Check `http://localhost:5000/api/health`.
 | GET | `/api/health` | Status + DB connection state |
 | GET/POST | `/api/stores` | List / create stores |
 | GET | `/api/stores/slug/:slug` | Public storefront lookup |
+| POST | `/api/stores/slug/:slug/pay/init` | Provider preflight + Paystack checkout intent |
+| POST | `/api/stores/slug/:slug/pay/verify` | Verify and settle a storefront payment once |
+| POST | `/api/wallet/paystack/init` and `/verify` | Verified agent wallet top-up |
+| POST | `/api/paystack/webhook` | Signed Paystack event receiver |
 | GET/PATCH/DELETE | `/api/stores/:id` | Read / update / delete a store |
 | GET/POST/PATCH/DELETE | `/api/bundles` | Data bundles (Pricing / Buy Data) |
 | GET/POST/PATCH/DELETE | `/api/agents` | Agents |
@@ -88,13 +92,19 @@ Whichever you use, two settings decide whether it works:
   Paystack return URL, so a stale value sends paying customers to the wrong host.
 - Atlas → Network Access must allow the host's outbound IPs.
 
+Also configure Paystack's webhook URL as
+`https://YOUR-API-HOST/api/paystack/webhook`; successful payments are then
+settled even when the customer's browser never returns from checkout. Financial
+writes use MongoDB transactions: Atlas supports them, while a local MongoDB must
+run as a replica set.
+
 Deploy this service **before** the frontend: `NEXT_PUBLIC_API_URL` is inlined
 into the Next.js bundle at build time, so that build needs this URL to exist.
 
 ## Fulfilment (Rema Data)
 
 Bundles are delivered by **Rema Data** (<https://remadata.com/api>). Every paid
-order — agent Buy Data, storefront wallet sale, storefront Paystack checkout —
+order — agent Buy Data or storefront Paystack checkout —
 goes through `lib/fulfilment.js`, which POSTs it to the provider, records the
 provider reference on the order, and **reverses the money** (wallet, platform
 margin, store and customer counters) if delivery fails. Orders come back as

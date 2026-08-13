@@ -10,3 +10,4 @@ export { Report } from "./Report.js";
 export { FeatureRequest } from "./FeatureRequest.js";
 export { Log } from "./Log.js";
 export { Settings } from "./Settings.js";
+export { Payment } from "./Payment.js";

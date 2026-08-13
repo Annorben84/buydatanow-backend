@@ -166,7 +166,7 @@ router.get("/stores/slug/:slug/bundles", async (req, res, next) => {
  * production this must sit behind the customer's own payment (they pay first,
  * then we fulfil) and/or rate limiting — otherwise it can drain a wallet.
  */
-router.post("/stores/slug/:slug/buy", async (req, res, next) => {
+if (false) router.post("/stores/slug/:slug/buy", async (req, res, next) => {
   try {
     const store = await Store.findOne({ slug: req.params.slug.toLowerCase() });
     if (!store) return res.status(404).json({ error: "Store not found" });
@@ -310,7 +310,7 @@ router.post("/stores/slug/:slug/buy", async (req, res, next) => {
  *   1) /pay/init   — start the payment, redirect the customer to Paystack
  *   2) /pay/verify — on return, confirm the payment and fulfil the order
  */
-router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
+if (false) router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
   try {
     if (!paystackConfigured()) {
       return res.status(500).json({ error: "Online payments aren't configured right now." });
@@ -361,7 +361,7 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
   }
 });
 
-router.post("/stores/slug/:slug/pay/verify", async (req, res, next) => {
+if (false) router.post("/stores/slug/:slug/pay/verify", async (req, res, next) => {
   try {
     if (!paystackConfigured()) {
       return res.status(500).json({ error: "Online payments aren't configured right now." });

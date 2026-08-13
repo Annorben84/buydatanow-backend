@@ -13,6 +13,8 @@ import authRoutes from "./authRoutes.js";
 import adminRoutes from "./adminRoutes.js";
 import walletRoutes from "./walletRoutes.js";
 import paystackRoutes from "./paystackRoutes.js";
+import storefrontPaymentRoutes from "./storefrontPaymentRoutes.js";
+import { paystackWebhook } from "./paystackWebhook.js";
 import { notFound, errorHandler } from "./middleware/error.js";
 
 const app = express();
@@ -20,6 +22,9 @@ const PORT = process.env.PORT || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 
 app.use(cors({ origin: CLIENT_URL.split(",").map((s) => s.trim()), credentials: true }));
+// Signature verification needs the untouched bytes, so this route must be
+// registered before the global JSON parser.
+app.post("/api/paystack/webhook", express.raw({ type: "application/json", limit: "1mb" }), paystackWebhook);
 app.use(express.json());
 app.use(morgan("dev"));
 
@@ -41,6 +46,9 @@ app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/wallet/paystack", paystackRoutes);
 app.use("/api/wallet", walletRoutes);
+// Mounted before the legacy catch-all routes so unsafe historical purchase
+// handlers can never be reached.
+app.use("/api", storefrontPaymentRoutes);
 app.use("/api", routes);
 
 app.use(notFound);
@@ -67,6 +75,8 @@ app.listen(PORT, () => {
   console.log(`  Fulfilment (Rema Data): ${remaStatus()}`);
 });
 
+let databaseRetryTimer = null;
+
 async function connectDatabase() {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
@@ -75,12 +85,20 @@ async function connectDatabase() {
   }
   try {
     await connectDB(uri);
+    databaseRetryTimer = null;
     console.log("✓ MongoDB connected");
     await ensureSuperadmin();
     // Rema accepts orders as "pending" and delivers moments later, so poll
     // the ones still in flight and settle (or refund) them.
     startFulfilmentPoller();
   } catch (err) {
+    if (!databaseRetryTimer) {
+      databaseRetryTimer = setTimeout(() => {
+        databaseRetryTimer = null;
+        void connectDatabase();
+      }, 30000);
+      databaseRetryTimer.unref?.();
+    }
     console.error("✗ MongoDB connection failed:", err.message);
     console.error("  The API is up, but DB routes will error until this is fixed.");
     console.error("  On a hosted deploy this is usually the database firewall:");

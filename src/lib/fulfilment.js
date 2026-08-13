@@ -1,81 +1,83 @@
 /*
- * Order fulfilment — hands a paid order to Rema Data and settles the outcome.
+ * Central order fulfilment and recovery for every purchase path.
  *
- * Every purchase path (agent Buy Data, storefront wallet, storefront Paystack)
- * funnels through `fulfilOrder`, so delivery, refunds and the ledger behave the
- * same everywhere. Rema accepts an order as "pending" and delivers moments
- * later, so an order can also settle asynchronously — `syncPendingOrders`
- * polls the ones still in flight and reverses the money for any that failed.
+ * Money is booked before this module runs. Dispatch is claimed atomically,
+ * Rema timeouts remain in-flight until reconciled, and confirmed failures are
+ * reversed once. Paystack-backed failures also queue a customer refund.
  */
 
-import { Agent, Order, Store, Customer, Transaction } from "../models/index.js";
+import { Agent, Customer, Order, Payment, Store, Transaction } from "../models/index.js";
 import { recordLog } from "./audit.js";
+import { withMongoTransaction } from "./mongoTransaction.js";
+import { requestPaystackRefundForOrder } from "./paystackRefund.js";
 import {
   remaBuyData,
-  remaOrderStatus,
-  remaLive,
   remaConfigured,
+  remaLive,
+  remaOrderByClientReference,
+  remaOrderStatus,
   validPhone,
 } from "./remaApi.js";
 
-const money = (n) => Math.round(n * 100) / 100;
+const money = (n) => Math.round(Number(n) * 100) / 100;
 
-/**
- * Whether an order may be marked delivered without actually being sent. Off by
- * default: it books real money against wallets, so it belongs to a disposable
- * development database only — never one with live agent balances in it.
- */
 const allowSimulatedSales = () =>
   String(process.env.REMA_ALLOW_SIMULATED_SALES || "").toLowerCase() === "true";
 
-/**
- * Deliver a paid order and record the outcome on it.
- *
- * With fulfilment switched off (local development — see REMA_FULFILMENT) no
- * provider call is made and the order completes as "simulated", so the whole
- * flow can be exercised without spending the Rema float.
- *
- * @param {import("mongoose").Document} order  A saved Order.
- * @param {object} [reversal]  What to put back if the provider can't deliver:
- *   `{ agent, agentName, credit, platformClawback, storeId }`. Omit for orders
- *   where nothing was charged.
- * @returns {Promise<{status: string, simulated?: boolean, message?: string}>}
- */
-export async function fulfilOrder(order, reversal) {
-  if (reversal) {
-    order.reversal = {
-      agent: reversal.agent,
-      agentName: reversal.agentName || "",
-      credit: money(reversal.credit || 0),
-      platformClawback: money(reversal.platformClawback || 0),
-      storeId: reversal.storeId,
-    };
+/** Claim and deliver a saved order. Safe when called by multiple recovery paths. */
+export async function fulfilOrder(inputOrder, reversal) {
+  const reversalPlan = reversal
+    ? {
+        agent: reversal.agent,
+        agentName: reversal.agentName || "",
+        credit: money(reversal.credit || 0),
+        platformClawback: money(reversal.platformClawback || 0),
+        agentWalletAdjustment:
+          reversal.agentWalletAdjustment == null
+            ? undefined
+            : money(reversal.agentWalletAdjustment),
+        platformWalletAdjustment:
+          reversal.platformWalletAdjustment == null
+            ? undefined
+            : money(reversal.platformWalletAdjustment),
+        storeId: reversal.storeId,
+      }
+    : undefined;
+
+  const set = { provider: "rema", providerStatus: "dispatching", status: "processing" };
+  if (reversalPlan) set.reversal = reversalPlan;
+
+  // Only the pending -> processing winner may POST to Rema. This protects
+  // callback verification, webhooks and the recovery poller from double-send.
+  let order = await Order.findOneAndUpdate(
+    { _id: inputOrder._id, status: "pending" },
+    { $set: set },
+    { new: true }
+  );
+  if (!order) {
+    order = await Order.findById(inputOrder._id);
+    return { status: order?.status || inputOrder.status, alreadyDispatched: true };
   }
 
   if (!remaLive()) {
-    // Settling an unsent order as "completed" still debits the buyer's wallet
-    // and books store revenue — real money for data nobody received. That is
-    // only ever acceptable against a throwaway database, so it takes an
-    // explicit opt-in; everywhere else the sale is refused and refunded.
     if (!allowSimulatedSales()) {
       return settleFailed(
         order,
         remaConfigured()
-          ? "Fulfilment is switched off (REMA_FULFILMENT), so this bundle was not sent."
+          ? "Fulfilment is switched off, so this bundle was not sent."
           : "The fulfilment provider is not configured, so this bundle was not sent."
       );
     }
     order.provider = "simulated";
     order.providerStatus = "simulated";
-    order.providerMessage = "Simulated — REMA_ALLOW_SIMULATED_SALES is on. Nothing was sent.";
+    order.providerMessage = "Simulated sale. Nothing was sent.";
     order.status = "completed";
     order.deliveredAt = new Date();
     await order.save();
+    await markPaymentFulfilled(order);
     return { status: order.status, simulated: true };
   }
 
-  // A wrong or missing recipient burns real money at the provider, so refuse
-  // before sending rather than after.
   if (!validPhone(order.phone)) {
     return settleFailed(order, "No valid recipient number on this order.");
   }
@@ -87,6 +89,21 @@ export async function fulfilOrder(order, reversal) {
     gb: order.gb,
   });
 
+  // POST timeouts are ambiguous. Rema may have accepted and charged the order,
+  // so never refund or send a duplicate until its client reference is found.
+  if (result.indeterminate) {
+    order.providerStatus = "unknown";
+    order.providerMessage = result.message;
+    order.status = "processing";
+    await order.save();
+    recordLog(
+      "warning",
+      `Rema purchase outcome unknown · ${order.ref} · awaiting reconciliation`,
+      "fulfilment"
+    );
+    return { status: order.status, indeterminate: true, message: result.message };
+  }
+
   if (!result.ok) {
     return settleFailed(order, result.message || "The provider rejected this order.");
   }
@@ -96,11 +113,12 @@ export async function fulfilOrder(order, reversal) {
   order.providerStatus = result.status;
   order.providerMessage = result.message;
   order.providerCost = money(result.cost || 0);
-  order.status = result.status; // "processing" until Rema confirms delivery
+  order.status = result.status;
   if (result.status === "completed") order.deliveredAt = new Date();
   await order.save();
 
-  if (result.status === "completed" || result.status === "processing") {
+  if (result.status === "completed") await markPaymentFulfilled(order);
+  if (["completed", "processing"].includes(result.status)) {
     recordLog(
       "info",
       `Order sent to Rema · ${order.ref} · ${order.carrier} ${order.gb}GB → ${order.phone}`,
@@ -110,11 +128,17 @@ export async function fulfilOrder(order, reversal) {
     return { status: order.status };
   }
 
-  // Rema answered OK but with a terminal status (e.g. already refunded).
   return settleFailed(order, result.message || "The provider could not deliver this order.");
 }
 
-/** Mark an order undeliverable, put the money back, and log it. */
+async function markPaymentFulfilled(order) {
+  if (!order.paymentReference) return;
+  await Payment.updateOne(
+    { reference: order.paymentReference, status: { $nin: ["refund_pending", "refunded"] } },
+    { $set: { status: "fulfilled" } }
+  );
+}
+
 async function settleFailed(order, message) {
   order.provider = order.provider || "rema";
   order.providerStatus = "failed";
@@ -127,136 +151,189 @@ async function settleFailed(order, message) {
     "warning",
     `Order not delivered · ${order.ref} · ${order.carrier} ${order.gb}GB · ${message}`,
     "fulfilment",
-    { refunded: reversed }
+    { reversed }
   );
-  return { status: order.status, message };
+  return { status: reversed ? "refunded" : order.status, message };
 }
 
-/**
- * Undo the money movement recorded when the order was placed: credit the
- * buyer's wallet, claw the platform margin back off the app owner, and roll
- * the store/customer counters back. Idempotent via `reversedAt`.
- *
- * Exported so support can settle an order that was booked but never delivered
- * — see POST /api/admin/orders/:ref/reverse.
- */
-export async function reverseOrder(order) {
-  if (order.reversedAt || !order.reversal?.agent) return false;
+/** Atomically undo internal accounting once, then queue any gateway refund. */
+export async function reverseOrder(inputOrder) {
+  if (inputOrder.reversedAt || !inputOrder.reversal?.agent) return false;
 
-  const { agent: agentId, agentName, credit, platformClawback, storeId } = order.reversal;
-  const label = `${order.carrier} ${order.gb}GB${order.phone ? ` · ${order.phone}` : ""}`;
+  const reversed = await withMongoTransaction(async (session) => {
+    const order = await Order.findOneAndUpdate(
+      {
+        _id: inputOrder._id,
+        $or: [{ reversedAt: { $exists: false } }, { reversedAt: null }],
+      },
+      { $set: { status: "refunded", reversedAt: new Date() } },
+      { new: true, session }
+    );
+    if (!order) return false;
 
-  if (credit > 0) {
-    const agent = await Agent.findById(agentId);
-    if (agent) {
-      agent.wallet = money(agent.wallet + credit);
-      await agent.save();
+    const { agent: agentId, agentName, credit, platformClawback, storeId } = order.reversal;
+    const agentAdjustment = Number.isFinite(order.reversal.agentWalletAdjustment)
+      ? money(order.reversal.agentWalletAdjustment)
+      : money(credit || 0);
+    const platformAdjustment = Number.isFinite(order.reversal.platformWalletAdjustment)
+      ? money(order.reversal.platformWalletAdjustment)
+      : money(-(platformClawback || 0));
+    const label = `${order.carrier} ${order.gb}GB${order.phone ? ` · ${order.phone}` : ""}`;
+
+    if (agentAdjustment !== 0) {
+      const agent = await Agent.findByIdAndUpdate(
+        agentId,
+        { $inc: { wallet: agentAdjustment } },
+        { new: true, session }
+      );
+      if (agent) {
+        await Transaction.create(
+          [
+            {
+              agentId,
+              agent: agentName || agent.name || "Agent",
+              store: order.store,
+              type: "refund",
+              description: `Order reversal · ${order.ref} · ${label}`,
+              amount: agentAdjustment,
+              reference: `${order.ref}-refund-agent`,
+            },
+          ],
+          { session }
+        );
+      }
     }
-    await Transaction.create({
-      agentId,
-      agent: agentName || agent?.name || "Agent",
-      store: order.store,
-      type: "refund",
-      description: `Refund · undelivered order ${order.ref} · ${label}`,
-      amount: credit,
-      reference: `${order.ref}-refund`,
-    });
-  }
 
-  if (platformClawback > 0) {
-    const superadmin = await Agent.findOne({ role: "superadmin" }).sort({ createdAt: 1 });
-    if (superadmin) {
-      superadmin.wallet = money(superadmin.wallet - platformClawback);
-      await superadmin.save();
-      await Transaction.create({
-        agentId: superadmin._id,
-        agent: superadmin.name,
-        store: order.store,
-        type: "refund",
-        description: `Platform margin reversed · ${order.ref} · ${label}`,
-        amount: -platformClawback,
-        reference: `${order.ref}-refund-platform`,
-      });
+    if (platformAdjustment !== 0) {
+      const superadmin = await Agent.findOne({ role: "superadmin" })
+        .sort({ createdAt: 1 })
+        .session(session);
+      if (superadmin) {
+        await Agent.updateOne(
+          { _id: superadmin._id },
+          { $inc: { wallet: platformAdjustment } },
+          { session }
+        );
+        await Transaction.create(
+          [
+            {
+              agentId: superadmin._id,
+              agent: superadmin.name,
+              store: order.store,
+              type: "refund",
+              description: `Platform margin reversed · ${order.ref} · ${label}`,
+              amount: platformAdjustment,
+              reference: `${order.ref}-refund-platform`,
+            },
+          ],
+          { session }
+        );
+      }
     }
-  }
 
-  if (storeId) {
-    await Store.updateOne({ _id: storeId }, { $inc: { orders: -1, revenue: -order.amount } });
-  }
-  if (order.phone) {
-    await Customer.updateOne(
-      { agent: agentId, phone: order.phone },
-      { $inc: { orders: -1, spent: -order.amount } }
+    if (storeId) {
+      await Store.updateOne(
+        { _id: storeId },
+        { $inc: { orders: -1, revenue: -order.amount } },
+        { session }
+      );
+    }
+    if (order.phone) {
+      await Customer.updateOne(
+        { agent: agentId, phone: order.phone },
+        { $inc: { orders: -1, spent: -order.amount } },
+        { session }
+      );
+    }
+    return true;
+  });
+
+  if (reversed && inputOrder.paymentReference) {
+    await requestPaystackRefundForOrder(
+      inputOrder,
+      inputOrder.providerMessage || "Data order was not delivered"
     );
   }
-
-  order.status = "refunded";
-  order.reversedAt = new Date();
-  await order.save();
-  return true;
+  return reversed;
 }
 
-/**
- * Poll Rema for orders still in flight and settle the ones that finished.
- * Safe to call repeatedly — only touches orders it sent and hasn't settled.
- */
+/** Recover undispatched orders and reconcile Rema orders still in flight. */
 export async function syncPendingOrders({ limit = 50 } = {}) {
-  if (!remaLive()) return { checked: 0, delivered: 0, failed: 0 };
+  const undispatched = await Order.find({ status: "pending" }).sort({ createdAt: 1 }).limit(limit);
+  for (const order of undispatched) await fulfilOrder(order);
 
-  const pending = await Order.find({
-    provider: "rema",
-    status: "processing",
-    providerRef: { $nin: [null, ""] },
+  // A database outage during reversal must not leave a charged failed order
+  // stranded forever. Retry only the atomic internal reversal; the refund
+  // helper has its own one-time claim.
+  const unreversed = await Order.find({
+    status: "failed",
+    "reversal.agent": { $exists: true, $ne: null },
+    $or: [{ reversedAt: { $exists: false } }, { reversedAt: null }],
   })
+    .sort({ createdAt: 1 })
+    .limit(limit);
+  for (const order of unreversed) await reverseOrder(order);
+
+  if (!remaLive()) {
+    return { checked: undispatched.length + unreversed.length, delivered: 0, failed: unreversed.length };
+  }
+
+  const pending = await Order.find({ provider: "rema", status: "processing" })
     .sort({ createdAt: 1 })
     .limit(limit);
 
   let delivered = 0;
   let failed = 0;
-
   for (const order of pending) {
-    const result = await remaOrderStatus(order.providerRef);
+    const result = order.providerRef
+      ? await remaOrderStatus(order.providerRef)
+      : await remaOrderByClientReference(order.ref);
     if (!result.ok || result.status === "processing") continue;
 
+    if (!order.providerRef && result.providerRef) order.providerRef = result.providerRef;
     order.providerStatus = result.raw || result.status;
-
     if (result.status === "completed") {
       order.status = "completed";
       order.deliveredAt = new Date();
       await order.save();
+      await markPaymentFulfilled(order);
       delivered++;
       continue;
     }
 
-    order.status = "failed";
     order.providerMessage = result.message || `Provider reported ${result.raw || "failed"}.`;
-    await order.save();
-    await reverseOrder(order);
+    await settleFailed(order, order.providerMessage);
     failed++;
-    recordLog(
-      "warning",
-      `Order failed at the provider · ${order.ref} · ${order.carrier} ${order.gb}GB`,
-      "fulfilment",
-      { providerRef: order.providerRef, providerStatus: order.providerStatus }
-    );
   }
 
-  return { checked: pending.length, delivered, failed };
+  return {
+    checked: pending.length + undispatched.length + unreversed.length,
+    delivered,
+    failed: failed + unreversed.length,
+  };
 }
 
-/**
- * Start the background status poller. No-op unless fulfilment is live and
- * REMA_POLL_SECONDS is above zero (default 90s).
- */
+let pollerTimer = null;
+
 export function startFulfilmentPoller() {
   const seconds = Number(process.env.REMA_POLL_SECONDS ?? 90);
-  if (!remaLive() || !Number.isFinite(seconds) || seconds <= 0) return null;
+  if (pollerTimer || !Number.isFinite(seconds) || seconds <= 0) return pollerTimer;
 
-  const timer = setInterval(() => {
-    syncPendingOrders().catch((err) =>
-      console.error("⚠ Fulfilment sync failed:", err?.message || err)
-    );
-  }, seconds * 1000);
-  timer.unref?.(); // never hold the process open
-  return timer;
+  let running = false;
+  const run = async () => {
+    if (running) return;
+    running = true;
+    try {
+      await syncPendingOrders();
+    } catch (err) {
+      console.error("⚠ Fulfilment sync failed:", err?.message || err);
+    } finally {
+      running = false;
+    }
+  };
+
+  void run();
+  pollerTimer = setInterval(run, seconds * 1000);
+  pollerTimer.unref?.();
+  return pollerTimer;
 }

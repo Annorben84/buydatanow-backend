@@ -1,52 +1,72 @@
+import { randomUUID } from "node:crypto";
 import { Router } from "express";
 
-import { Transaction } from "./models/index.js";
-import { requireAuth, publicAgent } from "./lib/auth.js";
+import { Payment } from "./models/index.js";
+import { requireAuth } from "./lib/auth.js";
 import { paystack, paystackConfigured, clientOrigin } from "./lib/paystackApi.js";
+import {
+  PaymentSettlementError,
+  settleVerifiedPayment,
+} from "./lib/paymentSettlement.js";
 
 const router = Router();
 router.use(requireAuth);
 
-const money = (n) => Math.round(n * 100) / 100;
+const money = (n) => Math.round(Number(n) * 100) / 100;
+const maxTopup = () => Number(process.env.PAYSTACK_MAX_TOPUP_GHS) || 10000;
 
-/**
- * POST /api/wallet/paystack/init — start a wallet top-up.
- * Amount is authoritative here (server-side); returns Paystack's hosted
- * checkout URL to redirect the user to. TEST MODE: no real money moves —
- * complete it with a Paystack test card.
- */
+/** Start a server-recorded Paystack wallet top-up. */
 router.post("/init", async (req, res, next) => {
   try {
     if (!paystackConfigured()) {
-      return res.status(500).json({ error: "Paystack is not configured (PAYSTACK_SECRET_KEY)." });
+      return res.status(500).json({ error: "Paystack is not configured." });
     }
-    const amount = money(Number(req.body?.amount));
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ error: "Enter a valid amount." });
+    const amount = money(req.body?.amount);
+    if (!Number.isFinite(amount) || amount < 1 || amount > maxTopup()) {
+      return res.status(400).json({
+        error: `Enter an amount from ₵1 to ₵${maxTopup().toLocaleString()}.`,
+      });
     }
     if (!req.agent.email) {
       return res.status(400).json({ error: "Your account needs an email to pay with Paystack." });
     }
 
-    const reference = `DP-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const reference = `DP-${randomUUID()}`;
+    const intent = await Payment.create({
+      reference,
+      purpose: "wallet_topup",
+      amount,
+      currency: "GHS",
+      email: req.agent.email,
+      agent: req.agent._id,
+    });
+
     const { ok, json } = await paystack("/transaction/initialize", {
       method: "POST",
       body: JSON.stringify({
         email: req.agent.email,
-        amount: Math.round(amount * 100), // subunit (pesewas/kobo)
+        amount: Math.round(amount * 100),
+        currency: "GHS",
         reference,
         callback_url: `${clientOrigin()}/agent/add-fund`,
-        metadata: { agentId: String(req.agent._id), purpose: "wallet_topup" },
+        metadata: {
+          agentId: String(req.agent._id),
+          purpose: "wallet_topup",
+        },
       }),
     });
-
     if (!ok || !json?.status) {
+      await Payment.updateOne(
+        { _id: intent._id },
+        { $set: { failureReason: json?.message || "Could not initialize Paystack." } }
+      );
       return res.status(502).json({ error: json?.message || "Could not start the payment." });
     }
+
     res.json({
       data: {
         authorization_url: json.data.authorization_url,
-        reference: json.data.reference,
+        reference,
         access_code: json.data.access_code,
       },
     });
@@ -55,59 +75,47 @@ router.post("/init", async (req, res, next) => {
   }
 });
 
-/**
- * POST /api/wallet/paystack/verify — confirm a payment and credit the wallet.
- * Idempotent: a reference is only ever credited once. Credits the amount
- * Paystack actually confirms (never what the client claims).
- */
+/** Verify and atomically credit a Paystack top-up exactly once. */
 router.post("/verify", async (req, res, next) => {
   try {
     if (!paystackConfigured()) {
-      return res.status(500).json({ error: "Paystack is not configured (PAYSTACK_SECRET_KEY)." });
+      return res.status(500).json({ error: "Paystack is not configured." });
     }
     const reference = String(req.body?.reference || "").trim();
     if (!reference) return res.status(400).json({ error: "Missing payment reference." });
 
-    // Already credited? Return the current state without touching the balance.
-    const existing = await Transaction.findOne({ reference });
-    if (existing) {
-      return res.json({
-        data: { agent: publicAgent(req.agent), transaction: existing, status: "success", alreadyCredited: true },
-      });
+    const intent = await Payment.findOne({ reference, purpose: "wallet_topup" }).lean();
+    if (!intent) return res.status(404).json({ error: "Payment intent not found." });
+    if (String(intent.agent) !== String(req.agent._id)) {
+      return res.status(403).json({ error: "This payment belongs to another account." });
     }
 
     const { ok, json } = await paystack(`/transaction/verify/${encodeURIComponent(reference)}`);
     if (!ok || !json?.status) {
       return res.status(502).json({ error: json?.message || "Could not verify the payment." });
     }
-
-    const data = json.data;
-    if (data.status !== "success") {
-      // e.g. "abandoned" / "failed" — nothing to credit.
-      return res.json({ data: { status: data.status } });
+    if (json.data?.status !== "success") {
+      await Payment.updateOne(
+        { _id: intent._id },
+        { $set: { gatewayStatus: String(json.data?.status || "unknown") } }
+      );
+      return res.json({ data: { status: json.data?.status || "unknown" } });
     }
 
-    // Guard: this payment must belong to the agent verifying it.
-    const owner = data.metadata?.agentId;
-    if (owner && owner !== String(req.agent._id)) {
-      return res.status(403).json({ error: "This payment belongs to another account." });
-    }
-
-    const amount = money((data.amount || 0) / 100);
-    req.agent.wallet = money(req.agent.wallet + amount);
-    await req.agent.save();
-
-    const transaction = await Transaction.create({
-      agentId: req.agent._id,
-      agent: req.agent.name,
-      type: "topup",
-      description: "Wallet top-up · Paystack",
-      amount,
-      reference,
+    const result = await settleVerifiedPayment(reference, json.data);
+    res.status(result.alreadySettled ? 200 : 201).json({
+      data: {
+        status: result.status,
+        agent: result.agent,
+        transaction: result.transaction,
+        payment: result.payment,
+        alreadyCredited: result.alreadySettled,
+      },
     });
-
-    res.status(201).json({ data: { agent: publicAgent(req.agent), transaction, status: "success" } });
   } catch (err) {
+    if (err instanceof PaymentSettlementError) {
+      return res.status(err.status).json({ error: err.message });
+    }
     next(err);
   }
 });

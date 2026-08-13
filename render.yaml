@@ -70,11 +70,12 @@ services:
         sync: false
 
       # ⚠ Live fulfilment — every order spends the Rema wallet.
-      # `auto` resolves to ON here because NODE_ENV=production.
+      # Explicitly enabled: every paid order is sent to Rema and spends the
+      # production wallet.
       - key: REMA_MODE
         value: live
       - key: REMA_FULFILMENT
-        value: auto
+        value: on
       - key: REMA_API_KEY_LIVE
         sync: false
       - key: REMA_POLL_SECONDS

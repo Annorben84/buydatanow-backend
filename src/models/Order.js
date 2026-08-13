@@ -32,6 +32,18 @@ const OrderSchema = new Schema(
     providerCost: { type: Number, default: 0 }, // what the provider charged us
     deliveredAt: { type: Date },
 
+    // The gateway payment behind a public storefront order. Wallet-funded
+    // agent purchases leave these blank.
+    paymentProvider: { type: String, default: "" },
+    paymentReference: { type: String, index: true, sparse: true },
+    refund: {
+      status: { type: String, default: "" },
+      providerRef: { type: String, default: "" },
+      message: { type: String, default: "" },
+      requestedAt: { type: Date },
+      updatedAt: { type: Date },
+    },
+
     // How to put the money back if the provider never delivers. Captured when
     // the order is placed because a failure can arrive minutes later, from the
     // status poller, long after the purchase request has gone.
@@ -40,6 +52,10 @@ const OrderSchema = new Schema(
       agentName: { type: String, default: "" },
       credit: { type: Number, default: 0 }, // put back on the buyer's wallet
       platformClawback: { type: Number, default: 0 }, // taken off the app owner
+      // Signed adjustments used by new orders. Positive returns a wallet debit;
+      // negative claws back a commission credited from a customer payment.
+      agentWalletAdjustment: { type: Number },
+      platformWalletAdjustment: { type: Number },
       storeId: { type: Schema.Types.ObjectId, ref: "Store" },
     },
     reversedAt: { type: Date },

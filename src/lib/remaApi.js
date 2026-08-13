@@ -86,13 +86,13 @@ async function rema(path, options = {}) {
     const json = await res.json().catch(() => ({}));
     // Rema answers 200 with `{"status":"error"}` on business failures, so the
     // HTTP code alone isn't enough to tell success from rejection.
-    return { ok: res.ok && json?.status !== "error", status: res.status, json };
+    return { ok: res.ok && json?.status !== "error", status: res.status, json, transportError: false };
   } catch (err) {
     const message =
       err?.name === "AbortError"
         ? `Rema Data did not respond within ${TIMEOUT_MS}ms.`
         : err?.message || "Rema Data is unreachable.";
-    return { ok: false, status: 0, json: { message } };
+    return { ok: false, status: 0, json: { message }, transportError: true };
   } finally {
     clearTimeout(timer);
   }
@@ -220,7 +220,7 @@ export async function remaBuyData({ ref, phone, carrier, gb }) {
     return { ok: false, message: `Rema Data doesn't sell a ${carrier} ${gb}GB bundle.` };
   }
 
-  const { ok, json } = await rema("/buy-data", {
+  const { ok, json, transportError } = await rema("/buy-data", {
     method: "POST",
     body: JSON.stringify({
       ref,
@@ -229,6 +229,19 @@ export async function remaBuyData({ ref, phone, carrier, gb }) {
       networkType: providerNetwork(carrier),
     }),
   });
+
+  // A timeout after POST is not a rejection: Rema may have accepted and
+  // charged the order before our connection dropped. Reconcile by our unique
+  // client reference and leave it in-flight when the outcome is still unknown.
+  if (!ok && transportError) {
+    const reconciled = await remaOrderByClientReference(ref);
+    if (reconciled.ok) return reconciled;
+    return {
+      ok: false,
+      indeterminate: true,
+      message: json?.message || "Rema did not return a definite purchase result.",
+    };
+  }
 
   const data = json?.data || {};
   return {
@@ -263,5 +276,38 @@ export async function remaOrders(params = {}) {
   const { ok, json } = await rema(`/orders${query ? `?${query}` : ""}`);
   if (!ok) return { ok: false, message: json?.message || "Could not read orders." };
   const data = json?.data;
-  return { ok: true, orders: Array.isArray(data) ? data : data?.orders || data?.data || [] };
+  const orders = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.orders)
+      ? data.orders
+      : Array.isArray(data?.data)
+        ? data.data
+        : data && (data.reference || data.client_reference || data.ref)
+          ? [data]
+          : [];
+  return { ok: true, orders };
+}
+
+/** Find an upstream order using the client reference we supplied on purchase. */
+export async function remaOrderByClientReference(ref) {
+  const result = await remaOrders({ ref_number: ref, per_page: 50 });
+  if (!result.ok) return result;
+
+  const wanted = String(ref);
+  const row = result.orders.find((item) => {
+    const clientRef =
+      item?.client_reference ?? item?.clientReference ?? item?.ref_number ?? item?.ref ?? "";
+    return String(clientRef) === wanted;
+  });
+  if (!row) return { ok: false, notFound: true, message: "Order not visible at Rema yet." };
+
+  const raw = String(row.status || row.order_status || "pending");
+  return {
+    ok: true,
+    providerRef: String(row.reference || row.order_reference || row._id || ""),
+    status: mapProviderStatus(raw),
+    raw,
+    message: String(row.message || ""),
+    cost: Number(row.amount || row.price) || 0,
+  };
 }

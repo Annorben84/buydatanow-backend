@@ -1,3 +1,5 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
+
 const PAYSTACK_BASE = "https://api.paystack.co";
 
 // PAYSTACK_MODE: "auto" (live in production-like envs, else test), "live", or "test".
@@ -20,6 +22,7 @@ const SECRET =
 const PUBLIC =
   (useLive ? process.env.PAYSTACK_PUBLIC_KEY_LIVE : process.env.PAYSTACK_PUBLIC_KEY_TEST) ||
   process.env.PAYSTACK_PUBLIC_KEY;
+const TIMEOUT_MS = Number(process.env.PAYSTACK_TIMEOUT_MS) || 20000;
 
 /** The effective Paystack environment in use: "live" or "test". */
 export const paystackMode = () => (useLive ? "live" : "test");
@@ -37,14 +40,40 @@ export function clientOrigin() {
 
 /** Call the Paystack REST API with the secret key. */
 export async function paystack(path, options = {}) {
-  const res = await fetch(`${PAYSTACK_BASE}${path}`, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${SECRET}`,
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
-  const json = await res.json().catch(() => ({}));
-  return { ok: res.ok, json };
+  if (!SECRET) {
+    return { ok: false, status: 0, json: { message: "Paystack is not configured." } };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(`${PAYSTACK_BASE}${path}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${SECRET}`,
+        "Content-Type": "application/json",
+        ...options.headers,
+      },
+    });
+    const json = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, json, transportError: false };
+  } catch (err) {
+    const message =
+      err?.name === "AbortError"
+        ? `Paystack did not respond within ${TIMEOUT_MS}ms.`
+        : err?.message || "Paystack is unreachable.";
+    return { ok: false, status: 0, json: { message }, transportError: true };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Validate `x-paystack-signature` against the untouched webhook body. */
+export function validPaystackSignature(rawBody, signature) {
+  if (!SECRET || !Buffer.isBuffer(rawBody) || typeof signature !== "string") return false;
+  const expected = createHmac("sha512", SECRET).update(rawBody).digest("hex");
+  const supplied = signature.trim().toLowerCase();
+  if (supplied.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(supplied, "hex"), Buffer.from(expected, "hex"));
 }
