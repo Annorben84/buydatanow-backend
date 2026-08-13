@@ -18,6 +18,7 @@ import { recordLog } from "./lib/audit.js";
 import { paystack, paystackConfigured, clientOrigin } from "./lib/paystackApi.js";
 import { fulfilOrder } from "./lib/fulfilment.js";
 import { validPhone, normalizePhone } from "./lib/remaApi.js";
+import { canSetSellingPrice } from "./lib/pricingPolicy.js";
 import { getSettings, publicSettings } from "./lib/settings.js";
 
 const router = Router();
@@ -538,9 +539,9 @@ router.put("/my-prices", async (req, res, next) => {
 
     const bundleDoc = await Bundle.findOne({ carrier, gb });
     if (!bundleDoc) return res.status(404).json({ error: "That bundle doesn't exist." });
-    if (price < bundleDoc.price) {
+    if (!canSetSellingPrice(req.agent.role, price, bundleDoc.price)) {
       return res.status(400).json({
-        error: `Your price can't be below the platform price (${bundleDoc.price.toFixed(2)}).`,
+        error: `Only a superadmin can set a price below the platform price (${bundleDoc.price.toFixed(2)}).`,
       });
     }
 

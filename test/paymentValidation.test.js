@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { paymentMismatch } from "../src/lib/paymentValidation.js";
 import { customerPaystackCharge } from "../src/lib/paystackFee.js";
+import { canSetSellingPrice, storefrontMargins } from "../src/lib/pricingPolicy.js";
 import { mapProviderStatus, normalizePhone, validPhone } from "../src/lib/remaApi.js";
 
 const walletIntent = {
@@ -43,6 +44,24 @@ test("validates the customer-paid total while preserving the principal", () => {
   const intent = { ...walletIntent, chargedAmount: 50.99, customerFee: 0.99 };
   assert.equal(paymentMismatch(intent, { ...walletPayment, amount: 5099 }), "");
   assert.match(paymentMismatch(intent, walletPayment), /amount/i);
+});
+
+test("allows only superadmins to set a selling price below platform price", () => {
+  assert.equal(canSetSellingPrice("agent", 4.5, 4.7), false);
+  assert.equal(canSetSellingPrice("agent", 4.7, 4.7), true);
+  assert.equal(canSetSellingPrice("superadmin", 4.5, 4.7), true);
+});
+
+test("charges a superadmin discount against platform margin", () => {
+  assert.deepEqual(
+    storefrontMargins({
+      role: "superadmin",
+      sellingPrice: 4.5,
+      platformPrice: 4.7,
+      providerCost: 4.2,
+    }),
+    { agentMargin: 0, platformMargin: 0.3 }
+  );
 });
 
 test("rejects forged or changed Paystack settlement fields", () => {

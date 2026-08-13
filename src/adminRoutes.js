@@ -17,6 +17,7 @@ import { requireAdmin, hashPassword } from "./lib/auth.js";
 import { recordLog } from "./lib/audit.js";
 import { crud } from "./lib/crud.js";
 import { getSettings } from "./lib/settings.js";
+import { withMongoTransaction } from "./lib/mongoTransaction.js";
 import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import {
@@ -605,6 +606,51 @@ const bundle = crud(Bundle);
 router.post("/bundles", bundle.create);
 router.patch("/bundles/:id", bundle.update);
 router.delete("/bundles/:id", bundle.remove);
+
+/** Atomically update both prices shown on the superadmin Data Pricing row. */
+router.put("/bundle-prices", async (req, res, next) => {
+  try {
+    const carrier = String(req.body.carrier || "").trim();
+    const gb = Number(req.body.gb);
+    const platformPrice = money(Number(req.body.platformPrice));
+    const sellingPrice = money(Number(req.body.sellingPrice));
+    if (!carrier || !Number.isFinite(gb) || gb <= 0) {
+      return res.status(400).json({ error: "Invalid bundle." });
+    }
+    if (!Number.isFinite(platformPrice) || platformPrice <= 0) {
+      return res.status(400).json({ error: "Enter a valid platform price." });
+    }
+    if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) {
+      return res.status(400).json({ error: "Enter a valid selling price." });
+    }
+
+    const result = await withMongoTransaction(async (session) => {
+      const platformBundle = await Bundle.findOneAndUpdate(
+        { carrier, gb },
+        { $set: { price: platformPrice } },
+        { new: true, runValidators: true, session }
+      );
+      if (!platformBundle) return null;
+
+      const selling = await AgentPrice.findOneAndUpdate(
+        { agent: req.agent._id, carrier, gb },
+        { $set: { price: sellingPrice } },
+        { new: true, upsert: true, runValidators: true, session }
+      );
+      return { bundle: platformBundle, selling };
+    });
+    if (!result) return res.status(404).json({ error: "That bundle doesn't exist." });
+
+    void recordLog(
+      "info",
+      `Bundle prices updated · ${carrier} ${gb}GB · platform ₵${platformPrice} · selling ₵${sellingPrice}`,
+      "admin/pricing"
+    );
+    res.json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /* ---------------------- Fulfilment provider (Rema) ------------------------ */
 /*

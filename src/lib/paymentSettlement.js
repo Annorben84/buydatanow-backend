@@ -256,6 +256,22 @@ export async function settleVerifiedPayment(reference, gatewayData) {
           { session }
         );
       }
+      if (claimed.platformMargin < 0) {
+        await Transaction.create(
+          [
+            {
+              agentId: superadmin._id,
+              agent: superadmin.name,
+              store: store.name,
+              type: "fee",
+              description: `Superadmin price subsidy · ${store.name} · ${claimed.network} ${claimed.gb}GB`,
+              amount: claimed.platformMargin,
+              reference: `${claimed.reference}-platform-subsidy`,
+            },
+          ],
+          { session }
+        );
+      }
       if (feeRecovery > 0) {
         await Transaction.create(
           [

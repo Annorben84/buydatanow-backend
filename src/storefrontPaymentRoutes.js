@@ -4,6 +4,7 @@ import { Router } from "express";
 import { Agent, AgentPrice, Bundle, Payment, Store } from "./models/index.js";
 import { clientOrigin, paystack, paystackConfigured } from "./lib/paystackApi.js";
 import { customerPaystackCharge, paystackFeePercent } from "./lib/paystackFee.js";
+import { canSetSellingPrice, storefrontMargins } from "./lib/pricingPolicy.js";
 import {
   PaymentSettlementError,
   settleVerifiedPayment,
@@ -72,11 +73,15 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
     const platformPrice = money(bundle.price);
     const providerCost = money(providerBundle.cost || bundle.cost || 0);
     const amount = money(ownPrice?.price ?? platformPrice);
-    if (amount < platformPrice) {
+    if (!canSetSellingPrice(owner.role, amount, platformPrice)) {
       return res.status(409).json({ error: "This store's bundle price needs administrator review." });
     }
-    const agentMargin = money(amount - platformPrice);
-    const platformMargin = money(Math.max(0, platformPrice - providerCost));
+    const { agentMargin, platformMargin } = storefrontMargins({
+      role: owner.role,
+      sellingPrice: amount,
+      platformPrice,
+      providerCost,
+    });
     const email = String(req.body.email || "").trim() || owner.email || "orders@buydatanow.store";
     const reference = `DP-${randomUUID()}`;
     const charge = customerPaystackCharge(amount);
