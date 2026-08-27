@@ -15,18 +15,16 @@ import {
 } from "./models/index.js";
 import { requireAdmin, hashPassword } from "./lib/auth.js";
 import { recordLog } from "./lib/audit.js";
-import { crud } from "./lib/crud.js";
 import { getSettings } from "./lib/settings.js";
-import { withMongoTransaction } from "./lib/mongoTransaction.js";
 import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import {
-  remaCatalog,
-  remaConfigured,
-  remaLive,
-  remaMode,
-  remaWalletBalance,
-} from "./lib/remaApi.js";
+  netpluseCatalog,
+  netpluseConfigured,
+  netpluseLive,
+  netpluseMode,
+  netpluseWalletBalance,
+} from "./lib/netpluseApi.js";
 
 const router = Router();
 
@@ -388,6 +386,7 @@ router.get("/overview", async (req, res, next) => {
           $group: {
             _id: null,
             volume: { $sum: "$amount" },
+            agentEarnings: { $sum: { $ifNull: ["$earning", 0] } },
             platformRevenue: { $sum: { $subtract: ["$amount", { $ifNull: ["$earning", 0] }] } },
             platformMargin: { $sum: { $ifNull: ["$platformEarning", 0] } },
             orders: { $sum: 1 },
@@ -442,7 +441,14 @@ router.get("/overview", async (req, res, next) => {
       orders: t.orders,
     }));
 
-    const totals = orderAgg[0] || { volume: 0, platformRevenue: 0, platformMargin: 0, orders: 0, payingAgents: [] };
+    const totals = orderAgg[0] || {
+      volume: 0,
+      agentEarnings: 0,
+      platformRevenue: 0,
+      platformMargin: 0,
+      orders: 0,
+      payingAgents: [],
+    };
     res.json({
       data: {
         totals: {
@@ -452,6 +458,7 @@ router.get("/overview", async (req, res, next) => {
           customers: customersTotal,
           walletsHeld: money(walletAgg[0]?.wallet || 0),
           volume: money(totals.volume),
+          agentEarnings: money(totals.agentEarnings),
           platformRevenue: money(totals.platformRevenue),
           platformMargin: money(totals.platformMargin),
           orders: totals.orders,
@@ -602,59 +609,101 @@ router.put("/settings", async (req, res, next) => {
  * The bundle catalog (and the price agents pay) is superadmin-owned.
  * Reads stay public on /api/bundles; writes live here.
  */
-const bundle = crud(Bundle);
-router.post("/bundles", bundle.create);
-router.patch("/bundles/:id", bundle.update);
-router.delete("/bundles/:id", bundle.remove);
+/** Find the authoritative Netpluse package for a local bundle identity. */
+async function providerPackage(carrier, gb, { force = false } = {}) {
+  if (!netpluseConfigured()) return null;
+  const rows = await netpluseCatalog({ force });
+  return rows.find((row) => row.carrier === carrier && row.gb === Number(gb)) || null;
+}
 
-/** Atomically update both prices shown on the superadmin Data Pricing row. */
-router.put("/bundle-prices", async (req, res, next) => {
+/** POST /api/admin/bundles — create with a server-fetched Netpluse base cost. */
+router.post("/bundles", async (req, res, next) => {
   try {
-    const carrier = String(req.body.carrier || "").trim();
-    const gb = Number(req.body.gb);
-    const platformPrice = money(Number(req.body.platformPrice));
-    const sellingPrice = money(Number(req.body.sellingPrice));
-    if (!carrier || !Number.isFinite(gb) || gb <= 0) {
-      return res.status(400).json({ error: "Invalid bundle." });
-    }
-    if (!Number.isFinite(platformPrice) || platformPrice <= 0) {
-      return res.status(400).json({ error: "Enter a valid platform price." });
-    }
-    if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) {
-      return res.status(400).json({ error: "Enter a valid selling price." });
+    const carrier = String(req.body?.carrier || "");
+    const gb = Number(req.body?.gb);
+    const upstream = await providerPackage(carrier, gb, { force: true });
+    if (!upstream) {
+      return res.status(400).json({
+        error: `Netpluse does not currently list a ${carrier || "selected network"} ${gb || "?"}GB bundle.`,
+      });
     }
 
-    const result = await withMongoTransaction(async (session) => {
-      const platformBundle = await Bundle.findOneAndUpdate(
-        { carrier, gb },
-        { $set: { price: platformPrice } },
-        { new: true, runValidators: true, session }
-      );
-      if (!platformBundle) return null;
+    const price = money(Number(req.body?.price));
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({ error: "Enter a valid agent price." });
+    }
+    if (price < money(upstream.cost)) {
+      return res.status(400).json({
+        error: `Agent price cannot be below the Netpluse base cost of GHS ${money(upstream.cost).toFixed(2)}.`,
+      });
+    }
 
-      const selling = await AgentPrice.findOneAndUpdate(
-        { agent: req.agent._id, carrier, gb },
-        { $set: { price: sellingPrice } },
-        { new: true, upsert: true, runValidators: true, session }
-      );
-      return { bundle: platformBundle, selling };
+    const doc = await Bundle.create({
+      carrier: upstream.carrier,
+      gb: upstream.gb,
+      size: `${upstream.gb} GB`,
+      cost: money(upstream.cost),
+      price,
+      active: req.body?.active !== false,
     });
-    if (!result) return res.status(404).json({ error: "That bundle doesn't exist." });
-
-    void recordLog(
+    recordLog(
       "info",
-      `Bundle prices updated · ${carrier} ${gb}GB · platform ₵${platformPrice} · selling ₵${sellingPrice}`,
-      "admin/pricing"
+      `Bundle added · ${upstream.carrier} ${upstream.capacity} · Netpluse cost GHS ${money(upstream.cost).toFixed(2)}`,
+      "admin/bundles"
     );
-    res.json({ data: result });
+    res.status(201).json({ data: doc });
   } catch (err) {
     next(err);
   }
 });
 
-/* ---------------------- Fulfilment provider (Rema) ------------------------ */
+/** PATCH /api/admin/bundles/:id — base cost stays provider-owned. */
+router.patch("/bundles/:id", async (req, res, next) => {
+  try {
+    const doc = await Bundle.findById(req.params.id);
+    if (!doc) return res.status(404).json({ error: "Not found" });
+
+    if (Object.hasOwn(req.body || {}, "price")) {
+      const upstream = await providerPackage(doc.carrier, doc.gb, { force: true });
+      if (!upstream) {
+        return res.status(409).json({
+          error: `Netpluse does not currently list ${doc.carrier} ${doc.gb}GB, so its margin cannot be changed.`,
+        });
+      }
+      const price = money(Number(req.body.price));
+      if (!Number.isFinite(price) || price <= 0) {
+        return res.status(400).json({ error: "Enter a valid agent price." });
+      }
+      if (price < money(upstream.cost)) {
+        return res.status(400).json({
+          error: `Agent price cannot be below the Netpluse base cost of GHS ${money(upstream.cost).toFixed(2)}.`,
+        });
+      }
+      doc.cost = money(upstream.cost);
+      doc.price = price;
+    }
+    if (typeof req.body?.active === "boolean") doc.active = req.body.active;
+
+    await doc.save();
+    res.json({ data: doc });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/bundles/:id", async (req, res, next) => {
+  try {
+    const doc = await Bundle.findByIdAndDelete(req.params.id);
+    if (!doc) return res.status(404).json({ error: "Not found" });
+    res.json({ data: { id: req.params.id, deleted: true } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* -------------------- Fulfilment provider (Netpluse) ---------------------- */
 /*
- * Every order the platform sells is delivered by Rema Data out of one shared
+ * Every order the platform sells is delivered by Netpluse out of one shared
  * float. These endpoints are how the app owner watches that float, keeps our
  * base costs in step with theirs, and chases orders still in flight.
  */
@@ -663,18 +712,18 @@ router.put("/bundle-prices", async (req, res, next) => {
 router.get("/provider", async (req, res, next) => {
   try {
     const [balance, catalog] = await Promise.all([
-      remaConfigured() ? remaWalletBalance() : Promise.resolve({ ok: false }),
-      remaConfigured() ? remaCatalog() : Promise.resolve([]),
+      netpluseConfigured() ? netpluseWalletBalance() : Promise.resolve({ ok: false }),
+      netpluseConfigured() ? netpluseCatalog() : Promise.resolve([]),
     ]);
     const inFlight = await Order.countDocuments({ status: "processing" });
 
     res.json({
       data: {
-        name: "Rema Data",
-        configured: remaConfigured(),
-        mode: remaMode(),
+        name: "Netpluse",
+        configured: netpluseConfigured(),
+        mode: netpluseMode(),
         // false = orders settle locally without being sent (development).
-        fulfilling: remaLive(),
+        fulfilling: netpluseLive(),
         balance: balance.ok ? balance.balance : null,
         currency: balance.ok ? balance.currency : "GHS",
         lastTransactionAt: balance.ok ? balance.lastTransactionAt : null,
@@ -688,10 +737,10 @@ router.get("/provider", async (req, res, next) => {
   }
 });
 
-/** GET /api/admin/provider/catalog — what Rema sells us, at our cost price. */
+/** GET /api/admin/provider/catalog — what Netpluse sells us, at our cost price. */
 router.get("/provider/catalog", async (req, res, next) => {
   try {
-    const rows = await remaCatalog({ force: req.query.refresh === "1" });
+    const rows = await netpluseCatalog({ force: req.query.refresh === "1" });
     res.json({ data: rows });
   } catch (err) {
     next(err);
@@ -699,18 +748,18 @@ router.get("/provider/catalog", async (req, res, next) => {
 });
 
 /**
- * POST /api/admin/provider/sync-costs — pull Rema's prices into `Bundle.cost`
+ * POST /api/admin/provider/sync-costs — pull Netpluse prices into `Bundle.cost`
  * so the platform margin shown on the dashboard reflects what we actually pay.
  * Selling prices are never touched. `?dryRun=1` reports without writing.
  */
 router.post("/provider/sync-costs", async (req, res, next) => {
   try {
-    if (!remaConfigured()) {
-      return res.status(409).json({ error: "Rema Data isn't configured." });
+    if (!netpluseConfigured()) {
+      return res.status(409).json({ error: "Netpluse isn't configured." });
     }
-    const rows = await remaCatalog({ force: true });
+    const rows = await netpluseCatalog({ force: true });
     if (!rows.length) {
-      return res.status(502).json({ error: "Could not read the Rema catalog." });
+      return res.status(502).json({ error: "Could not read the Netpluse catalog." });
     }
 
     const dryRun = req.body?.dryRun === true || req.query.dryRun === "1";
@@ -755,7 +804,7 @@ router.post("/orders/:ref/reverse", async (req, res, next) => {
     if (order.reversedAt) {
       return res.status(409).json({ error: `Already reversed on ${order.reversedAt.toISOString()}.` });
     }
-    if (order.provider === "rema" && order.status === "completed") {
+    if (order.provider && order.provider !== "simulated" && order.status === "completed") {
       return res.status(409).json({
         error: "The provider delivered this order — raise it with them before refunding.",
       });

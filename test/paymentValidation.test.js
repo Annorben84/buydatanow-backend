@@ -4,7 +4,13 @@ import assert from "node:assert/strict";
 import { paymentMismatch } from "../src/lib/paymentValidation.js";
 import { customerPaystackCharge } from "../src/lib/paystackFee.js";
 import { canSetSellingPrice, storefrontMargins } from "../src/lib/pricingPolicy.js";
-import { mapProviderStatus, normalizePhone, validPhone } from "../src/lib/remaApi.js";
+import {
+  capacityInGb,
+  mapProviderStatus,
+  netpluseSimulatedSalesAllowed,
+  normalizePhone,
+  validPhone,
+} from "../src/lib/netpluseApi.js";
 
 const walletIntent = {
   reference: "DP-test-reference",
@@ -64,6 +70,25 @@ test("charges a superadmin discount against platform margin", () => {
   );
 });
 
+test("splits a direct agent sale without crediting profit into the wallet", () => {
+  const platformPrice = 4.7;
+  const sellingPrice = 5.1;
+  const economics = storefrontMargins({
+    role: "agent",
+    sellingPrice,
+    platformPrice,
+    providerCost: 4.4,
+  });
+
+  assert.deepEqual(economics, { agentMargin: 0.4, platformMargin: 0.3 });
+  assert.equal(platformPrice, 4.7, "the prepaid wallet debit is provider cost plus commission");
+  assert.equal(
+    Math.round((sellingPrice - platformPrice) * 100) / 100,
+    0.4,
+    "the customer-paid difference stays with the agent"
+  );
+});
+
 test("rejects forged or changed Paystack settlement fields", () => {
   assert.match(paymentMismatch(walletIntent, { ...walletPayment, amount: 4999 }), /amount/i);
   assert.match(paymentMismatch(walletIntent, { ...walletPayment, currency: "NGN" }), /currency/i);
@@ -110,4 +135,21 @@ test("normalizes Ghana recipients and provider terminal states", () => {
   assert.equal(mapProviderStatus("delivered"), "completed");
   assert.equal(mapProviderStatus("refunded"), "refunded");
   assert.equal(mapProviderStatus("pending"), "processing");
+  assert.equal(capacityInGb("1GB"), 1);
+  assert.equal(capacityInGb("500MB"), 0.5);
+});
+
+test("requires explicit opt-in before treating a sale as simulated", () => {
+  const previous = process.env.NETPLUSE_ALLOW_SIMULATED_SALES;
+  try {
+    delete process.env.NETPLUSE_ALLOW_SIMULATED_SALES;
+    assert.equal(netpluseSimulatedSalesAllowed(), false);
+    process.env.NETPLUSE_ALLOW_SIMULATED_SALES = "true";
+    assert.equal(netpluseSimulatedSalesAllowed(), true);
+    process.env.NETPLUSE_ALLOW_SIMULATED_SALES = "false";
+    assert.equal(netpluseSimulatedSalesAllowed(), false);
+  } finally {
+    if (previous === undefined) delete process.env.NETPLUSE_ALLOW_SIMULATED_SALES;
+    else process.env.NETPLUSE_ALLOW_SIMULATED_SALES = previous;
+  }
 });

@@ -19,8 +19,8 @@ services:
     # Frankfurt is the closest region to Ghana. Others: oregon, ohio, virginia, singapore.
     region: frankfurt
     # `starter` stays awake. On `free` the instance sleeps after ~15 minutes
-    # idle, which stops the background poller — orders accepted by Rema as
-    # "pending" would then sit in `processing` until the next request wakes it.
+    # idle, which stops the background poller — provider orders accepted as
+    # "processing" would then wait until the next request wakes it.
     plan: starter
     buildCommand: npm ci --omit=dev
     startCommand: npm start
@@ -70,18 +70,15 @@ services:
       - key: PAYSTACK_FEE_PERCENT
         value: "1.95"
 
-      # ⚠ Live fulfilment — every order spends the Rema wallet.
-      # Explicitly enabled: every paid order is sent to Rema and spends the
-      # production wallet.
-      - key: REMA_MODE
-        value: live
-      - key: REMA_FULFILMENT
-        value: on
-      - key: REMA_API_KEY_LIVE
+      # Netpluse data fulfilment. Keep this off while checkout is in test mode.
+      # Set to `on` only when real delivery and wallet spending are intended.
+      - key: NETPLUSE_BASE_URL
+        value: https://netpluse.shop/api/v1
+      - key: NETPLUSE_API_KEY
         sync: false
-      - key: REMA_POLL_SECONDS
+      - key: NETPLUSE_FULFILMENT
+        value: off
+      - key: NETPLUSE_POLL_SECONDS
         value: "90"
-      # Never true on a database with real balances: it books wallet debits for
-      # bundles that were never sent.
-      - key: REMA_ALLOW_SIMULATED_SALES
-        value: "false"
+      - key: NETPLUSE_ALLOW_SIMULATED_SALES
+        value: "true"

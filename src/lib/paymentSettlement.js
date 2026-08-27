@@ -12,6 +12,7 @@ import { withMongoTransaction } from "./mongoTransaction.js";
 import { requestPaystackRefundForPayment } from "./paystackRefund.js";
 import { paymentMismatch } from "./paymentValidation.js";
 import { recordLog } from "./audit.js";
+import { bookAgentWalletStorefrontOrder } from "./directPaymentSettlement.js";
 
 const money = (n) => Math.round(Number(n) * 100) / 100;
 
@@ -33,7 +34,7 @@ function publicStatus(payment) {
 
 /**
  * Atomically settle a Paystack success exactly once, then dispatch a newly
- * booked storefront order to Rema outside the database transaction.
+ * booked storefront order to Netpluse outside the database transaction.
  */
 export async function settleVerifiedPayment(reference, gatewayData) {
   const transactionResult = await withMongoTransaction(async (session) => {
@@ -68,6 +69,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
         $set: {
           status: "processing",
           gatewayStatus: String(gatewayData.status),
+          gatewayChannel: String(gatewayData.channel || gatewayData.authorization?.channel || ""),
           paystackId: String(gatewayData.id || ""),
           gatewayFee: money((Number(gatewayData.fees) || 0) / 100),
         },
@@ -107,7 +109,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
             reference: claimed.reference,
           },
         ],
-        { session }
+        { session, ordered: true }
       );
       if (feeRecovery !== 0 || claimed.gatewayFee > 0) {
         const superadmin = await Agent.findOne({ role: "superadmin" })
@@ -145,13 +147,19 @@ export async function settleVerifiedPayment(reference, gatewayData) {
               }
             );
           }
-          if (gatewayRows.length) await Transaction.create(gatewayRows, { session });
+          if (gatewayRows.length) {
+            await Transaction.create(gatewayRows, { session, ordered: true });
+          }
         }
       }
       claimed.status = "succeeded";
       claimed.settledAt = new Date();
       await claimed.save({ session });
       return { action: "wallet", paymentId: claimed._id, agentId: agent._id };
+    }
+
+    if (claimed.settlementModel === "agent_wallet_debit") {
+      return bookAgentWalletStorefrontOrder(claimed, session);
     }
 
     const store = await Store.findOne({ _id: claimed.store, agent: claimed.agent }).session(session);
@@ -195,7 +203,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
           },
         },
       ],
-      { session }
+      { session, ordered: true }
     );
 
     const customerResult = await Customer.updateOne(
@@ -227,7 +235,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
             reference: `${claimed.reference}-margin`,
           },
         ],
-        { session }
+        { session, ordered: true }
       );
     }
 
@@ -253,7 +261,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
               reference: `${claimed.reference}-platform`,
             },
           ],
-          { session }
+          { session, ordered: true }
         );
       }
       if (claimed.platformMargin < 0) {
@@ -269,7 +277,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
               reference: `${claimed.reference}-platform-subsidy`,
             },
           ],
-          { session }
+          { session, ordered: true }
         );
       }
       if (feeRecovery > 0) {
@@ -285,7 +293,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
               reference: `${claimed.reference}-paystack-fee-recovery`,
             },
           ],
-          { session }
+          { session, ordered: true }
         );
       }
       if (claimed.gatewayFee > 0) {
@@ -301,7 +309,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
               reference: `${claimed.reference}-paystack-fee`,
             },
           ],
-          { session }
+          { session, ordered: true }
         );
       }
     }

@@ -8,6 +8,7 @@ import {
   Customer,
   Transaction,
   AgentPrice,
+  Payment,
   Report,
   FeatureRequest,
 } from "./models/index.js";
@@ -15,11 +16,16 @@ import { crud } from "./lib/crud.js";
 import { crudScoped } from "./lib/crudScoped.js";
 import { requireAuth } from "./lib/auth.js";
 import { recordLog } from "./lib/audit.js";
-import { paystack, paystackConfigured, clientOrigin } from "./lib/paystackApi.js";
+import { paystack, paystackConfigured, paystackMode, clientOrigin } from "./lib/paystackApi.js";
 import { fulfilOrder } from "./lib/fulfilment.js";
-import { validPhone, normalizePhone } from "./lib/remaApi.js";
+import { validPhone, normalizePhone } from "./lib/netpluseApi.js";
 import { canSetSellingPrice } from "./lib/pricingPolicy.js";
 import { getSettings, publicSettings } from "./lib/settings.js";
+import {
+  PaystackSubaccountError,
+  provisionPaystackSubaccount,
+  validMomoProvider,
+} from "./lib/paystackSubaccount.js";
 
 const router = Router();
 
@@ -61,7 +67,23 @@ router.get("/stores/slug/:slug", async (req, res, next) => {
   try {
     const doc = await Store.findOne({ slug: req.params.slug.toLowerCase() }).lean();
     if (!doc) return res.status(404).json({ error: "Store not found" });
-    res.json({ data: doc });
+    res.json({
+      data: {
+        _id: doc._id,
+        name: doc.name,
+        slug: doc.slug,
+        phone: doc.phone || "",
+        whatsapp: doc.whatsapp || "",
+        status: doc.status,
+        paymentMethod: doc.paymentMethod || "momo",
+        paymentProvider: doc.paymentProvider || "Mobile Money",
+        paymentAccountName:
+          doc.paymentMethod === "bank_transfer" ? doc.paymentAccountName || doc.name : "",
+        paymentAccount:
+          doc.paymentMethod === "bank_transfer" ? doc.paymentAccount || doc.phone || "" : "",
+        paymentInstructions: doc.paymentInstructions || "",
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -508,10 +530,131 @@ router.use(requireAuth);
 
 /* Stores — each agent sees and manages only their own. */
 const store = crudScoped(Store);
+const storeFields = [
+  "name",
+  "slug",
+  "phone",
+  "whatsapp",
+  "status",
+  "paymentMethod",
+  "paymentProvider",
+  "paymentAccountName",
+  "paymentAccount",
+  "paymentInstructions",
+  "momoProvider",
+];
+
+function editableStore(body, { creating = false } = {}) {
+  const patch = {};
+  for (const field of storeFields) {
+    if (body[field] !== undefined) patch[field] = String(body[field]).trim();
+  }
+  if (patch.slug) {
+    patch.slug = patch.slug.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  }
+  if (patch.paymentMethod && !["momo", "bank_transfer"].includes(patch.paymentMethod)) {
+    throw Object.assign(new Error("Choose Mobile Money or bank transfer."), { status: 400 });
+  }
+  if (patch.status && !["active", "paused"].includes(patch.status)) {
+    throw Object.assign(new Error("Invalid store status."), { status: 400 });
+  }
+  if (creating) {
+    patch.status = "active";
+    patch.paymentMethod ||= "momo";
+    patch.paymentProvider ||= "Mobile Money";
+    patch.momoProvider ||= "mtn";
+    patch.paymentAccountName ||= patch.name || "";
+    patch.paymentAccount ||= patch.phone || "";
+  }
+  return patch;
+}
+
+function validateStore(patch, current = {}) {
+  const merged = { ...current, ...patch };
+  if (String(merged.name || "").length < 2) return "Enter a store name.";
+  if (String(merged.slug || "").length < 2) return "Enter a valid store link.";
+  if (String(merged.phone || "").replace(/\D/g, "").length < 9) return "Enter a valid phone number.";
+  if (String(merged.whatsapp || "").replace(/\D/g, "").length < 9) return "Enter a valid WhatsApp number.";
+  if (String(merged.paymentAccount || "").length < 5) return "Configure where customers should pay you.";
+  if (String(merged.paymentAccountName || "").length < 2) return "Enter the payment account name.";
+  if (merged.paymentMethod === "momo" && !validMomoProvider(merged.momoProvider)) {
+    return "Choose MTN, AT Money, or Telecel Mobile Money.";
+  }
+  return "";
+}
+
 router.get("/stores", store.list);
-router.post("/stores", store.create);
+router.post("/stores", async (req, res, next) => {
+  try {
+    const payload = editableStore(req.body, { creating: true });
+    const error = validateStore(payload);
+    if (error) return res.status(400).json({ error });
+    if (await Store.exists({ slug: payload.slug })) {
+      return res.status(409).json({ error: "That store link is already taken." });
+    }
+    if (payload.paymentMethod === "momo") {
+      const subaccount = await provisionPaystackSubaccount({
+        businessName: payload.name,
+        momoProvider: payload.momoProvider,
+        momoName: payload.paymentAccountName,
+        momoNumber: payload.paymentAccount,
+        contactEmail: req.agent.email,
+      });
+      Object.assign(payload, subaccount);
+    }
+    const doc = await Store.create({ ...payload, agent: req.agent._id });
+    res.status(201).json({ data: doc });
+  } catch (err) {
+    if (err instanceof PaystackSubaccountError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    next(err);
+  }
+});
 router.get("/stores/:id", store.get);
-router.patch("/stores/:id", store.update);
+router.patch("/stores/:id", async (req, res, next) => {
+  try {
+    const current = await Store.findOne({ _id: req.params.id, agent: req.agent._id }).lean();
+    if (!current) return res.status(404).json({ error: "Not found" });
+    const patch = editableStore(req.body);
+    const error = validateStore(patch, current);
+    if (error) return res.status(400).json({ error });
+    const merged = { ...current, ...patch };
+    const momoDetailsChanged = ["name", "momoProvider", "paymentAccountName", "paymentAccount"]
+      .some((field) => String(merged[field] || "") !== String(current[field] || ""));
+    if (
+      merged.paymentMethod === "momo" &&
+      (momoDetailsChanged ||
+        !/^ACCT_[A-Za-z0-9]+$/.test(String(current.paystackSubaccountCode || "")) ||
+        !current.paystackSubaccountActive ||
+        (current.paystackSubaccountMode && current.paystackSubaccountMode !== paystackMode()))
+    ) {
+      const subaccount = await provisionPaystackSubaccount({
+        existingCode:
+          current.paystackSubaccountMode && current.paystackSubaccountMode !== paystackMode()
+            ? ""
+            : current.paystackSubaccountCode,
+        businessName: merged.name,
+        momoProvider: merged.momoProvider,
+        momoName: merged.paymentAccountName,
+        momoNumber: merged.paymentAccount,
+        contactEmail: req.agent.email,
+      });
+      Object.assign(patch, subaccount);
+    }
+    const doc = await Store.findOneAndUpdate(
+      { _id: current._id, agent: req.agent._id },
+      { $set: patch },
+      { new: true, runValidators: true }
+    );
+    res.json({ data: doc });
+  } catch (err) {
+    if (err instanceof PaystackSubaccountError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    next(err);
+  }
+});
 router.delete("/stores/:id", store.remove);
 
 /*
@@ -539,9 +682,10 @@ router.put("/my-prices", async (req, res, next) => {
 
     const bundleDoc = await Bundle.findOne({ carrier, gb });
     if (!bundleDoc) return res.status(404).json({ error: "That bundle doesn't exist." });
-    if (!canSetSellingPrice(req.agent.role, price, bundleDoc.price)) {
+    const platformPrice = money(bundleDoc.price);
+    if (!canSetSellingPrice(req.agent.role, price, platformPrice)) {
       return res.status(400).json({
-        error: `Only a superadmin can set a price below the platform price (${bundleDoc.price.toFixed(2)}).`,
+        error: `Your price can't be below the platform price (${platformPrice.toFixed(2)}).`,
       });
     }
 
@@ -652,29 +796,51 @@ router.get("/earnings", async (req, res, next) => {
     const dayMs = 24 * 60 * 60 * 1000;
     const startToday = new Date();
     startToday.setHours(0, 0, 0, 0);
-    const weekStart = new Date(startToday.getTime() - 6 * dayMs);
-    const prevWeekStart = new Date(weekStart.getTime() - 7 * dayMs);
+    const sevenDayStart = new Date(startToday.getTime() - 6 * dayMs);
+    const previousSevenDayStart = new Date(sevenDayStart.getTime() - 7 * dayMs);
+    const monthStart = new Date(startToday.getFullYear(), startToday.getMonth(), 1);
+    const thirtyDayStart = new Date(startToday.getTime() - 29 * dayMs);
     const done = { agent: agentId, status: "completed" };
 
-    const [totalsAgg, weekAgg, prevWeekAgg, dayAgg, storeAgg, recent] = await Promise.all([
+    const periodAggregate = (from, to) => {
+      const createdAt = to ? { $gte: from, $lt: to } : { $gte: from };
+      return Order.aggregate([
+        { $match: { ...done, createdAt } },
+        { $group: { _id: null, earnings: { $sum: "$earning" }, orders: { $sum: 1 } } },
+      ]);
+    };
+
+    const [
+      totalsAgg,
+      todayAgg,
+      sevenDayAgg,
+      previousSevenDayAgg,
+      monthAgg,
+      dayAgg,
+      storeAgg,
+      recent,
+    ] = await Promise.all([
       Order.aggregate([
         { $match: done },
         { $group: { _id: null, earnings: { $sum: "$earning" }, orders: { $sum: 1 } } },
       ]),
+      periodAggregate(startToday),
+      periodAggregate(sevenDayStart),
+      periodAggregate(previousSevenDayStart, sevenDayStart),
+      periodAggregate(monthStart),
       Order.aggregate([
-        { $match: { ...done, createdAt: { $gte: weekStart } } },
-        { $group: { _id: null, earnings: { $sum: "$earning" } } },
-      ]),
-      Order.aggregate([
-        { $match: { ...done, createdAt: { $gte: prevWeekStart, $lt: weekStart } } },
-        { $group: { _id: null, earnings: { $sum: "$earning" } } },
-      ]),
-      Order.aggregate([
-        { $match: { ...done, createdAt: { $gte: weekStart } } },
+        { $match: { ...done, createdAt: { $gte: thirtyDayStart } } },
         {
           $group: {
-            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d",
+                date: "$createdAt",
+                timezone: "Africa/Accra",
+              },
+            },
             value: { $sum: "$earning" },
+            orders: { $sum: 1 },
           },
         },
       ]),
@@ -686,25 +852,39 @@ router.get("/earnings", async (req, res, next) => {
       Order.find(done).sort({ createdAt: -1 }).limit(6).lean(),
     ]);
 
-    const byDay = new Map(dayAgg.map((d) => [d._id, d.value]));
-    const weekly = [];
-    for (let i = 6; i >= 0; i--) {
+    const byDay = new Map(dayAgg.map((d) => [d._id, d]));
+    const daily30 = [];
+    for (let i = 29; i >= 0; i--) {
       const d = new Date(startToday.getTime() - i * dayMs);
-      weekly.push({
+      const aggregate = byDay.get(d.toISOString().slice(0, 10));
+      daily30.push({
+        date: d.toISOString().slice(0, 10),
         day: d.toLocaleDateString("en-US", { weekday: "short" }),
-        value: money(byDay.get(d.toISOString().slice(0, 10)) || 0),
+        label: d.toLocaleDateString("en-GB", { day: "numeric", month: "short" }),
+        value: money(aggregate?.value || 0),
+        orders: aggregate?.orders || 0,
       });
     }
 
     const totals = totalsAgg[0] || { earnings: 0, orders: 0 };
+    const today = todayAgg[0] || { earnings: 0, orders: 0 };
+    const sevenDays = sevenDayAgg[0] || { earnings: 0, orders: 0 };
+    const previousSevenDays = previousSevenDayAgg[0] || { earnings: 0, orders: 0 };
+    const month = monthAgg[0] || { earnings: 0, orders: 0 };
     res.json({
       data: {
         totalEarnings: money(totals.earnings),
         completedOrders: totals.orders,
         avgEarning: totals.orders > 0 ? money(totals.earnings / totals.orders) : 0,
-        weekEarnings: money(weekAgg[0]?.earnings || 0),
-        prevWeekEarnings: money(prevWeekAgg[0]?.earnings || 0),
-        weekly,
+        todayEarnings: money(today.earnings),
+        todayOrders: today.orders,
+        weekEarnings: money(sevenDays.earnings),
+        weekOrders: sevenDays.orders,
+        prevWeekEarnings: money(previousSevenDays.earnings),
+        monthEarnings: money(month.earnings),
+        monthOrders: month.orders,
+        weekly: daily30.slice(-7),
+        daily30,
         byStore: storeAgg.map((s) => ({ name: s._id || "—", value: money(s.value) })),
         recent: recent.map((o) => ({
           ref: o.ref,
@@ -725,5 +905,77 @@ router.get("/earnings", async (req, res, next) => {
 router.get("/orders", crudScoped(Order).list);
 router.get("/customers", crudScoped(Customer).list);
 router.get("/transactions", crudScoped(Transaction, "agentId").list);
+
+/** Paystack intents belonging only to the signed-in agent. */
+router.get("/payments", async (req, res, next) => {
+  try {
+    const docs = await Payment.find({ agent: req.agent._id })
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .populate("store", "name")
+      .lean();
+    res.json({
+      data: docs.map((p) => ({
+        reference: p.reference,
+        purpose: p.purpose,
+        status: p.status,
+        amount: money(p.amount || 0),
+        email: p.email || "",
+        payerName: p.payerName || "",
+        phone: p.phone || "",
+        store: p.store?.name || p.storeSlug || "—",
+        provider: p.provider,
+        paymentMethod: p.paymentMethod || "",
+        customerReference: p.customerReference || "",
+        walletDebit: money(p.platformPrice || 0),
+        network: p.network || "",
+        gb: p.gb || 0,
+        gatewayChannel: p.gatewayChannel || "",
+        createdAt: p.createdAt,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Resellers directly attached to the signed-in agent, with live sales totals. */
+router.get("/sub-agents", async (req, res, next) => {
+  try {
+    const agents = await Agent.find({ parentAgent: req.agent._id })
+      .sort({ createdAt: -1 })
+      .lean();
+    if (agents.length === 0) return res.json({ data: [] });
+
+    const ids = agents.map((a) => a._id);
+    const [storeRows, salesRows] = await Promise.all([
+      Store.aggregate([
+        { $match: { agent: { $in: ids } } },
+        { $group: { _id: "$agent", stores: { $sum: 1 } } },
+      ]),
+      Order.aggregate([
+        { $match: { agent: { $in: ids }, status: "completed" } },
+        { $group: { _id: "$agent", sales: { $sum: "$amount" } } },
+      ]),
+    ]);
+    const storesByAgent = new Map(storeRows.map((row) => [String(row._id), row.stores]));
+    const salesByAgent = new Map(salesRows.map((row) => [String(row._id), money(row.sales)]));
+
+    res.json({
+      data: agents.map((a) => ({
+        id: String(a._id),
+        name: a.name,
+        phone: a.phone || "",
+        stores: storesByAgent.get(String(a._id)) || 0,
+        sales: salesByAgent.get(String(a._id)) || 0,
+        discount: money(a.discount || 0),
+        status: a.status === "active" ? "active" : "inactive",
+        createdAt: a.createdAt,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 export default router;

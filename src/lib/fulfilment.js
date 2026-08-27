@@ -2,7 +2,7 @@
  * Central order fulfilment and recovery for every purchase path.
  *
  * Money is booked before this module runs. Dispatch is claimed atomically,
- * Rema timeouts remain in-flight until reconciled, and confirmed failures are
+ * Netpluse timeouts remain in-flight until reconciled, and confirmed failures are
  * reversed once. Paystack-backed failures also queue a customer refund.
  */
 
@@ -11,18 +11,15 @@ import { recordLog } from "./audit.js";
 import { withMongoTransaction } from "./mongoTransaction.js";
 import { requestPaystackRefundForOrder } from "./paystackRefund.js";
 import {
-  remaBuyData,
-  remaConfigured,
-  remaLive,
-  remaOrderByClientReference,
-  remaOrderStatus,
+  netpluseBuyData,
+  netpluseConfigured,
+  netpluseLive,
+  netpluseOrderStatus,
+  netpluseSimulatedSalesAllowed,
   validPhone,
-} from "./remaApi.js";
+} from "./netpluseApi.js";
 
 const money = (n) => Math.round(Number(n) * 100) / 100;
-
-const allowSimulatedSales = () =>
-  String(process.env.REMA_ALLOW_SIMULATED_SALES || "").toLowerCase() === "true";
 
 /** Claim and deliver a saved order. Safe when called by multiple recovery paths. */
 export async function fulfilOrder(inputOrder, reversal) {
@@ -41,13 +38,14 @@ export async function fulfilOrder(inputOrder, reversal) {
             ? undefined
             : money(reversal.platformWalletAdjustment),
         storeId: reversal.storeId,
+        newCustomer: Boolean(reversal.newCustomer),
       }
     : undefined;
 
-  const set = { provider: "rema", providerStatus: "dispatching", status: "processing" };
+  const set = { provider: "netpluse", providerStatus: "dispatching", status: "processing" };
   if (reversalPlan) set.reversal = reversalPlan;
 
-  // Only the pending -> processing winner may POST to Rema. This protects
+  // Only the pending -> processing winner may POST to Netpluse. This protects
   // callback verification, webhooks and the recovery poller from double-send.
   let order = await Order.findOneAndUpdate(
     { _id: inputOrder._id, status: "pending" },
@@ -59,11 +57,11 @@ export async function fulfilOrder(inputOrder, reversal) {
     return { status: order?.status || inputOrder.status, alreadyDispatched: true };
   }
 
-  if (!remaLive()) {
-    if (!allowSimulatedSales()) {
+  if (!netpluseLive()) {
+    if (!netpluseSimulatedSalesAllowed()) {
       return settleFailed(
         order,
-        remaConfigured()
+        netpluseConfigured()
           ? "Fulfilment is switched off, so this bundle was not sent."
           : "The fulfilment provider is not configured, so this bundle was not sent."
       );
@@ -82,14 +80,14 @@ export async function fulfilOrder(inputOrder, reversal) {
     return settleFailed(order, "No valid recipient number on this order.");
   }
 
-  const result = await remaBuyData({
+  const result = await netpluseBuyData({
     ref: order.ref,
     phone: order.phone,
     carrier: order.carrier,
     gb: order.gb,
   });
 
-  // POST timeouts are ambiguous. Rema may have accepted and charged the order,
+  // POST timeouts are ambiguous. Netpluse may have accepted and charged the order,
   // so never refund or send a duplicate until its client reference is found.
   if (result.indeterminate) {
     order.providerStatus = "unknown";
@@ -98,7 +96,7 @@ export async function fulfilOrder(inputOrder, reversal) {
     await order.save();
     recordLog(
       "warning",
-      `Rema purchase outcome unknown · ${order.ref} · awaiting reconciliation`,
+      `Netpluse purchase outcome unknown · ${order.ref} · awaiting reconciliation`,
       "fulfilment"
     );
     return { status: order.status, indeterminate: true, message: result.message };
@@ -108,7 +106,7 @@ export async function fulfilOrder(inputOrder, reversal) {
     return settleFailed(order, result.message || "The provider rejected this order.");
   }
 
-  order.provider = "rema";
+  order.provider = "netpluse";
   order.providerRef = result.providerRef;
   order.providerStatus = result.status;
   order.providerMessage = result.message;
@@ -121,7 +119,7 @@ export async function fulfilOrder(inputOrder, reversal) {
   if (["completed", "processing"].includes(result.status)) {
     recordLog(
       "info",
-      `Order sent to Rema · ${order.ref} · ${order.carrier} ${order.gb}GB → ${order.phone}`,
+      `Order sent to Netpluse · ${order.ref} · ${order.carrier} ${order.gb}GB → ${order.phone}`,
       "fulfilment",
       { providerRef: order.providerRef, cost: order.providerCost }
     );
@@ -140,7 +138,7 @@ async function markPaymentFulfilled(order) {
 }
 
 async function settleFailed(order, message) {
-  order.provider = order.provider || "rema";
+  order.provider = order.provider || "netpluse";
   order.providerStatus = "failed";
   order.providerMessage = message;
   order.status = "failed";
@@ -171,7 +169,7 @@ export async function reverseOrder(inputOrder) {
     );
     if (!order) return false;
 
-    const { agent: agentId, agentName, credit, platformClawback, storeId } = order.reversal;
+    const { agent: agentId, agentName, credit, platformClawback, storeId, newCustomer } = order.reversal;
     const agentAdjustment = Number.isFinite(order.reversal.agentWalletAdjustment)
       ? money(order.reversal.agentWalletAdjustment)
       : money(credit || 0);
@@ -199,7 +197,7 @@ export async function reverseOrder(inputOrder) {
               reference: `${order.ref}-refund-agent`,
             },
           ],
-          { session }
+          { session, ordered: true }
         );
       }
     }
@@ -226,7 +224,7 @@ export async function reverseOrder(inputOrder) {
               reference: `${order.ref}-refund-platform`,
             },
           ],
-          { session }
+          { session, ordered: true }
         );
       }
     }
@@ -234,7 +232,13 @@ export async function reverseOrder(inputOrder) {
     if (storeId) {
       await Store.updateOne(
         { _id: storeId },
-        { $inc: { orders: -1, revenue: -order.amount } },
+        {
+          $inc: {
+            orders: -1,
+            revenue: -order.amount,
+            customers: newCustomer ? -1 : 0,
+          },
+        },
         { session }
       );
     }
@@ -248,16 +252,26 @@ export async function reverseOrder(inputOrder) {
     return true;
   });
 
-  if (reversed && inputOrder.paymentReference) {
+  if (reversed && inputOrder.paymentProvider === "paystack" && inputOrder.paymentReference) {
     await requestPaystackRefundForOrder(
       inputOrder,
       inputOrder.providerMessage || "Data order was not delivered"
+    );
+  } else if (reversed && inputOrder.paymentReference) {
+    await Payment.updateOne(
+      { reference: inputOrder.paymentReference },
+      {
+        $set: {
+          status: "refunded",
+          failureReason: inputOrder.providerMessage || "Data order was not delivered",
+        },
+      }
     );
   }
   return reversed;
 }
 
-/** Recover undispatched orders and reconcile Rema orders still in flight. */
+/** Recover undispatched orders and reconcile Netpluse orders still in flight. */
 export async function syncPendingOrders({ limit = 50 } = {}) {
   const undispatched = await Order.find({ status: "pending" }).sort({ createdAt: 1 }).limit(limit);
   for (const order of undispatched) await fulfilOrder(order);
@@ -274,21 +288,43 @@ export async function syncPendingOrders({ limit = 50 } = {}) {
     .limit(limit);
   for (const order of unreversed) await reverseOrder(order);
 
-  if (!remaLive()) {
+  if (!netpluseLive()) {
     return { checked: undispatched.length + unreversed.length, delivered: 0, failed: unreversed.length };
   }
 
-  const pending = await Order.find({ provider: "rema", status: "processing" })
+  const pending = await Order.find({ provider: "netpluse", status: "processing" })
     .sort({ createdAt: 1 })
     .limit(limit);
 
   let delivered = 0;
   let failed = 0;
   for (const order of pending) {
+    const retryingPurchase = !order.providerRef;
     const result = order.providerRef
-      ? await remaOrderStatus(order.providerRef)
-      : await remaOrderByClientReference(order.ref);
-    if (!result.ok || result.status === "processing") continue;
+      ? await netpluseOrderStatus(order.providerRef)
+      : await netpluseBuyData({
+          ref: order.ref,
+          phone: order.phone,
+          carrier: order.carrier,
+          gb: order.gb,
+        });
+    if (!result.ok) {
+      if (retryingPurchase && !result.indeterminate) {
+        order.providerMessage = result.message || "Netpluse rejected the retried order.";
+        await settleFailed(order, order.providerMessage);
+        failed++;
+      }
+      continue;
+    }
+    if (result.status === "processing") {
+      if (!order.providerRef && result.providerRef) {
+        order.providerRef = result.providerRef;
+        order.providerStatus = result.status;
+        order.providerCost = money(result.cost || order.providerCost || 0);
+        await order.save();
+      }
+      continue;
+    }
 
     if (!order.providerRef && result.providerRef) order.providerRef = result.providerRef;
     order.providerStatus = result.raw || result.status;
@@ -316,7 +352,7 @@ export async function syncPendingOrders({ limit = 50 } = {}) {
 let pollerTimer = null;
 
 export function startFulfilmentPoller() {
-  const seconds = Number(process.env.REMA_POLL_SECONDS ?? 90);
+  const seconds = Number(process.env.NETPLUSE_POLL_SECONDS ?? 90);
   if (pollerTimer || !Number.isFinite(seconds) || seconds <= 0) return pollerTimer;
 
   let running = false;

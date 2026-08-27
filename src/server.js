@@ -6,7 +6,7 @@ import morgan from "morgan";
 import { connectDB, dbState } from "./config/db.js";
 import { ensureSuperadmin } from "./lib/auth.js";
 import { paystackMode, paystackConfigured } from "./lib/paystackApi.js";
-import { remaStatus } from "./lib/remaApi.js";
+import { netpluseStatus } from "./lib/netpluseApi.js";
 import { startFulfilmentPoller } from "./lib/fulfilment.js";
 import routes from "./routes.js";
 import authRoutes from "./authRoutes.js";
@@ -37,7 +37,7 @@ app.get("/api/health", (req, res) => {
     status: "ok",
     db: dbState(),
     paystack: paystackConfigured() ? paystackMode() : "not-configured",
-    fulfilment: remaStatus(),
+    fulfilment: netpluseStatus(),
     time: new Date().toISOString(),
   });
 });
@@ -72,7 +72,7 @@ app.listen(PORT, () => {
   console.log(`→ BuyDataNow API listening on port ${PORT}`);
   console.log(`  CORS origin: ${CLIENT_URL}`);
   console.log(`  Paystack: ${paystackConfigured() ? `${paystackMode()} mode` : "not configured"}`);
-  console.log(`  Fulfilment (Rema Data): ${remaStatus()}`);
+  console.log(`  Fulfilment (Netpluse): ${netpluseStatus()}`);
 });
 
 let databaseRetryTimer = null;
@@ -88,7 +88,7 @@ async function connectDatabase() {
     databaseRetryTimer = null;
     console.log("✓ MongoDB connected");
     await ensureSuperadmin();
-    // Rema accepts orders as "pending" and delivers moments later, so poll
+    // Netpluse accepts orders as "processing" and delivers moments later, so poll
     // the ones still in flight and settle (or refund) them.
     startFulfilmentPoller();
   } catch (err) {

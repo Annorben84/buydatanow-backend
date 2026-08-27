@@ -5,7 +5,7 @@ import { Agent, AgentPrice, Bundle, Order, Transaction, Withdrawal } from "./mod
 import { requireAuth, publicAgent } from "./lib/auth.js";
 import { fulfilOrder } from "./lib/fulfilment.js";
 import { withMongoTransaction } from "./lib/mongoTransaction.js";
-import { normalizePhone, validPhone } from "./lib/remaApi.js";
+import { normalizePhone, validPhone } from "./lib/netpluseApi.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -42,7 +42,7 @@ router.post("/withdraw", async (req, res, next) => {
       if (!agent) return null;
       const [withdrawal] = await Withdrawal.create(
         [{ agent: agent._id, agentName: agent.name, amount, method, destination }],
-        { session }
+        { session, ordered: true }
       );
       return { agent, withdrawal };
     });
@@ -65,7 +65,7 @@ router.get("/withdrawals", async (req, res, next) => {
   }
 });
 
-/** Book a wallet-funded data order atomically, then dispatch it to Rema. */
+/** Book a wallet-funded data order atomically, then dispatch it to Netpluse. */
 router.post("/spend", async (req, res, next) => {
   try {
     const network = String(req.body.network || "").trim();
@@ -100,7 +100,7 @@ router.post("/spend", async (req, res, next) => {
             reference: `${ref}-purchase`,
           },
         ],
-        { session }
+        { session, ordered: true }
       );
       const [order] = await Order.create(
         [
@@ -121,7 +121,7 @@ router.post("/spend", async (req, res, next) => {
             },
           },
         ],
-        { session }
+        { session, ordered: true }
       );
       return { agent, transaction, order };
     });

@@ -15,6 +15,9 @@ const AgentSchema = new Schema(
     status: { type: String, enum: ["active", "suspended"], default: "active" },
     // Platform role — "superadmin" unlocks the /admin console and admin APIs.
     role: { type: String, enum: ["agent", "superadmin"], default: "agent" },
+    // Optional reseller hierarchy. Null means this is a direct platform agent.
+    parentAgent: { type: Schema.Types.ObjectId, ref: "Agent", default: null, index: true },
+    discount: { type: Number, min: 0, max: 100, default: 0 },
   },
   { timestamps: true }
 );

@@ -23,8 +23,8 @@ const OrderSchema = new Schema(
       default: "pending",
     },
 
-    // Upstream fulfilment (Rema Data). `provider` is "rema" for real orders and
-    // "simulated" when fulfilment is switched off — see lib/remaApi.js.
+    // Upstream fulfilment. `provider` is "netpluse" for real orders and
+    // "simulated" when fulfilment is switched off — see lib/netpluseApi.js.
     provider: { type: String, default: "" },
     providerRef: { type: String, index: true },
     providerStatus: { type: String, default: "" },
@@ -53,10 +53,11 @@ const OrderSchema = new Schema(
       credit: { type: Number, default: 0 }, // put back on the buyer's wallet
       platformClawback: { type: Number, default: 0 }, // taken off the app owner
       // Signed adjustments used by new orders. Positive returns a wallet debit;
-      // negative claws back a commission credited from a customer payment.
+      // negative claws back a platform commission credited during settlement.
       agentWalletAdjustment: { type: Number },
       platformWalletAdjustment: { type: Number },
       storeId: { type: Schema.Types.ObjectId, ref: "Store" },
+      newCustomer: { type: Boolean, default: false },
     },
     reversedAt: { type: Date },
   },
