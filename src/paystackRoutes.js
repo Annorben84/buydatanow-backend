@@ -36,6 +36,7 @@ router.post("/init", async (req, res, next) => {
     const charge = customerPaystackCharge(amount);
     const chargedAmount = money(charge.totalSubunit / 100);
     const customerFee = money(charge.feeSubunit / 100);
+    const callbackPath = req.agent.role === "superadmin" ? "/admin/add-fund" : "/agent/add-fund";
     const intent = await Payment.create({
       reference,
       purpose: "wallet_topup",
@@ -54,7 +55,7 @@ router.post("/init", async (req, res, next) => {
         amount: charge.totalSubunit,
         currency: "GHS",
         reference,
-        callback_url: `${clientOrigin()}/agent/add-fund`,
+        callback_url: `${clientOrigin()}${callbackPath}`,
         metadata: {
           agentId: String(req.agent._id),
           purpose: "wallet_topup",

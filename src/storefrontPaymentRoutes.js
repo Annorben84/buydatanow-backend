@@ -35,6 +35,7 @@ function directPaymentDetails(store) {
 }
 
 function publicPaymentStatus(payment) {
+  const phone = String(payment.phone || "").replace(/\D/g, "");
   return {
     reference: payment.reference,
     status: payment.status,
@@ -43,6 +44,10 @@ function publicPaymentStatus(payment) {
     customerFee: money(payment.customerFee || 0),
     gatewayStatus: payment.gatewayStatus || "",
     order: payment.order || null,
+    network: payment.network || "",
+    gb: Number(payment.gb) || 0,
+    recipient: phone ? `${"*".repeat(Math.max(0, phone.length - 4))}${phone.slice(-4)}` : "",
+    updatedAt: payment.updatedAt || null,
     failureReason: ["rejected", "refunded", "failed"].includes(payment.status)
       ? payment.failureReason || ""
       : "",

@@ -25,6 +25,7 @@ const SettingsSchema = new Schema(
     autoApproveSmallFunds: { type: Boolean, default: true },
     transactionFeePct: { type: Number, default: 1.5 },
     withdrawalFee: { type: Number, default: 2.0 },
+    waecCheckerMargin: { type: Number, min: 0, default: 0 },
     whatsappAlerts: { type: Boolean, default: true },
     smsAlerts: { type: Boolean, default: false },
   },

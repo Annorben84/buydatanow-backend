@@ -20,6 +20,7 @@ import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import {
   netpluseCatalog,
+  netpluseCheckers,
   netpluseConfigured,
   netpluseLive,
   netpluseMode,
@@ -612,7 +613,7 @@ router.put("/settings", async (req, res, next) => {
 /** Find the authoritative Netpluse package for a local bundle identity. */
 async function providerPackage(carrier, gb, { force = false } = {}) {
   if (!netpluseConfigured()) return null;
-  const rows = await netpluseCatalog({ force });
+  const rows = await netpluseCatalog({ force, allowStale: !force });
   return rows.find((row) => row.carrier === carrier && row.gb === Number(gb)) || null;
 }
 
@@ -737,11 +738,91 @@ router.get("/provider", async (req, res, next) => {
   }
 });
 
-/** GET /api/admin/provider/catalog — what Netpluse sells us, at our cost price. */
+/** GET /api/admin/provider/catalog — a live, non-cached Netpluse cost catalog. */
 router.get("/provider/catalog", async (req, res, next) => {
   try {
-    const rows = await netpluseCatalog({ force: req.query.refresh === "1" });
+    if (!netpluseConfigured()) {
+      return res.status(409).json({ error: "Netpluse isn't configured." });
+    }
+    const rows = await netpluseCatalog({ force: true, allowStale: false });
     res.json({ data: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** GET /api/admin/provider/wholesale-bundles — live Netpluse costs for admin purchases. */
+router.get("/provider/wholesale-bundles", async (_req, res, next) => {
+  try {
+    if (!netpluseConfigured()) {
+      return res.status(409).json({ error: "Netpluse isn't configured." });
+    }
+    const rows = await netpluseCatalog({ force: true, allowStale: false });
+    res.json({
+      data: rows.map((row) => ({
+        id: `${row.carrier}-${row.capacity}`,
+        carrier: row.carrier,
+        gb: row.gb,
+        size: `${row.gb} GB`,
+        cost: money(row.cost),
+        price: money(row.cost),
+        active: true,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function waecCheckerPricing() {
+  if (!netpluseConfigured()) {
+    const error = new Error("Netpluse isn't configured.");
+    error.status = 409;
+    throw error;
+  }
+  const [checkers, settings] = await Promise.all([netpluseCheckers(), getSettings()]);
+  const checker = checkers.find((item) => item.id === "waec");
+  if (!checker) {
+    const error = new Error("Netpluse does not currently list the WAEC Result Checker.");
+    error.status = 502;
+    throw error;
+  }
+  const margin = money(Number(settings.waecCheckerMargin) || 0);
+  return {
+    ...checker,
+    baseCost: money(checker.price),
+    margin,
+    sellingPrice: money(checker.price + margin),
+  };
+}
+
+/** GET /api/admin/provider/checkers/waec — live cost plus the platform margin. */
+router.get("/provider/checkers/waec", async (_req, res, next) => {
+  try {
+    res.json({ data: await waecCheckerPricing() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** PUT /api/admin/provider/checkers/waec/margin — set the WAEC selling margin. */
+router.put("/provider/checkers/waec/margin", async (req, res, next) => {
+  try {
+    const margin = Number(req.body?.margin);
+    if (!Number.isFinite(margin) || margin < 0 || margin > 1000) {
+      return res.status(400).json({ error: "Enter a margin between GHS 0.00 and GHS 1,000.00." });
+    }
+
+    const settings = await getSettings();
+    settings.waecCheckerMargin = money(margin);
+    await settings.save();
+    const pricing = await waecCheckerPricing();
+    recordLog(
+      "info",
+      `WAEC checker margin updated · GHS ${pricing.margin.toFixed(2)} · selling price GHS ${pricing.sellingPrice.toFixed(2)}`,
+      "admin/provider/checkers/waec"
+    );
+    res.json({ data: pricing });
   } catch (err) {
     next(err);
   }
@@ -757,7 +838,7 @@ router.post("/provider/sync-costs", async (req, res, next) => {
     if (!netpluseConfigured()) {
       return res.status(409).json({ error: "Netpluse isn't configured." });
     }
-    const rows = await netpluseCatalog({ force: true });
+    const rows = await netpluseCatalog({ force: true, allowStale: false });
     if (!rows.length) {
       return res.status(502).json({ error: "Could not read the Netpluse catalog." });
     }
@@ -782,7 +863,7 @@ router.post("/provider/sync-costs", async (req, res, next) => {
     if (!dryRun && changed.length) {
       recordLog("info", `Provider costs synced · ${changed.length} bundle(s) updated`, "admin/provider");
     }
-    res.json({ data: { dryRun, updated: changed.length, changed, unmatched } });
+    res.json({ data: { dryRun, updated: changed.length, changed, unmatched, catalog: rows } });
   } catch (err) {
     next(err);
   }

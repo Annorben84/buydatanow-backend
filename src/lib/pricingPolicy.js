@@ -5,6 +5,12 @@ export function canSetSellingPrice(role, sellingPrice, platformPrice) {
   return role === "superadmin" || money(sellingPrice) >= money(platformPrice);
 }
 
+/** Superadmins buy at provider cost; agents keep their configured retail price. */
+export function walletPurchasePrice({ role, providerCost, agentPrice, platformPrice }) {
+  if (role === "superadmin") return money(providerCost);
+  return money(agentPrice ?? platformPrice);
+}
+
 /** Split a storefront principal while charging a superadmin discount to the platform. */
 export function storefrontMargins({ role, sellingPrice, platformPrice, providerCost }) {
   const selling = money(sellingPrice);

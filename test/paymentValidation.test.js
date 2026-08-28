@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 
 import { paymentMismatch } from "../src/lib/paymentValidation.js";
 import { customerPaystackCharge } from "../src/lib/paystackFee.js";
-import { canSetSellingPrice, storefrontMargins } from "../src/lib/pricingPolicy.js";
+import {
+  canSetSellingPrice,
+  storefrontMargins,
+  walletPurchasePrice,
+} from "../src/lib/pricingPolicy.js";
 import {
   capacityInGb,
   mapProviderStatus,
@@ -56,6 +60,22 @@ test("allows only superadmins to set a selling price below platform price", () =
   assert.equal(canSetSellingPrice("agent", 4.5, 4.7), false);
   assert.equal(canSetSellingPrice("agent", 4.7, 4.7), true);
   assert.equal(canSetSellingPrice("superadmin", 4.5, 4.7), true);
+});
+
+test("charges superadmin wallet purchases at provider wholesale cost", () => {
+  assert.equal(
+    walletPurchasePrice({
+      role: "superadmin",
+      providerCost: 4.4,
+      agentPrice: 5.1,
+      platformPrice: 4.7,
+    }),
+    4.4
+  );
+  assert.equal(
+    walletPurchasePrice({ role: "agent", providerCost: 4.4, platformPrice: 4.7 }),
+    4.7
+  );
 });
 
 test("charges a superadmin discount against platform margin", () => {

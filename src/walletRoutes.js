@@ -5,7 +5,8 @@ import { Agent, AgentPrice, Bundle, Order, Transaction, Withdrawal } from "./mod
 import { requireAuth, publicAgent } from "./lib/auth.js";
 import { fulfilOrder } from "./lib/fulfilment.js";
 import { withMongoTransaction } from "./lib/mongoTransaction.js";
-import { normalizePhone, validPhone } from "./lib/netpluseApi.js";
+import { netpluseCatalog, normalizePhone, validPhone } from "./lib/netpluseApi.js";
+import { walletPurchasePrice } from "./lib/pricingPolicy.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -75,10 +76,29 @@ router.post("/spend", async (req, res, next) => {
       return res.status(400).json({ error: "Enter the phone number that should receive the data." });
     }
 
-    const bundle = await Bundle.findOne({ carrier: network, gb, active: true }).lean();
-    if (!bundle) return res.status(400).json({ error: "That bundle isn't available." });
-    const own = await AgentPrice.findOne({ agent: req.agent._id, carrier: network, gb }).lean();
-    const amount = money(own?.price ?? bundle.price);
+    let amount;
+    if (req.agent.role === "superadmin") {
+      const catalog = await netpluseCatalog({ force: true, allowStale: false });
+      const providerBundle = catalog.find(
+        (item) => item.carrier === network && item.gb === gb
+      );
+      if (!providerBundle) {
+        return res.status(400).json({ error: "That bundle is not listed by Netpluse." });
+      }
+      amount = walletPurchasePrice({
+        role: req.agent.role,
+        providerCost: providerBundle.cost,
+      });
+    } else {
+      const bundle = await Bundle.findOne({ carrier: network, gb, active: true }).lean();
+      if (!bundle) return res.status(400).json({ error: "That bundle isn't available." });
+      const own = await AgentPrice.findOne({ agent: req.agent._id, carrier: network, gb }).lean();
+      amount = walletPurchasePrice({
+        role: req.agent.role,
+        agentPrice: own?.price,
+        platformPrice: bundle.price,
+      });
+    }
 
     const booked = await withMongoTransaction(async (session) => {
       const agent = await Agent.findOneAndUpdate(

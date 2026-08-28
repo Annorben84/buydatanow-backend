@@ -117,13 +117,22 @@ export function mapProviderStatus(status = "") {
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 let catalog = { at: 0, rows: [] };
 
-export async function netpluseCatalog({ force = false } = {}) {
+function liveCatalogError(message) {
+  const error = new Error(message || "Could not read the live Netpluse package catalog.");
+  error.status = 502;
+  return error;
+}
+
+export async function netpluseCatalog({ force = false, allowStale = true } = {}) {
   const fresh = Date.now() - catalog.at < CATALOG_TTL_MS;
   if (!force && fresh && catalog.rows.length) return catalog.rows;
 
   const { ok, json } = await netpluse("/packages");
   const packages = json?.packages ?? json?.data?.packages ?? json?.data;
-  if (!ok || !Array.isArray(packages)) return catalog.rows;
+  if (!ok || !Array.isArray(packages)) {
+    if (allowStale && catalog.rows.length) return catalog.rows;
+    throw liveCatalogError(json?.error || json?.message);
+  }
 
   const rows = packages
     .map((item) => {
@@ -139,8 +148,32 @@ export async function netpluseCatalog({ force = false } = {}) {
     })
     .filter((item) => item.carrier && item.gb > 0 && item.capacity && item.cost >= 0);
 
-  if (rows.length) catalog = { at: Date.now(), rows };
-  return catalog.rows;
+  if (!rows.length) {
+    if (allowStale && catalog.rows.length) return catalog.rows;
+    throw liveCatalogError("Netpluse returned no valid data packages.");
+  }
+
+  catalog = { at: Date.now(), rows };
+  return rows;
+}
+
+/** Live result-checker catalogue and current provider prices. */
+export async function netpluseCheckers() {
+  const { ok, json } = await netpluse("/checkers");
+  const checkers = json?.checkers ?? json?.data?.checkers ?? json?.data;
+  if (!ok || !Array.isArray(checkers)) {
+    throw liveCatalogError(json?.error || json?.message || "Could not read Netpluse result checkers.");
+  }
+
+  return checkers
+    .map((item) => ({
+      id: String(item.id || "").trim().toLowerCase(),
+      name: String(item.name || "").trim(),
+      description: String(item.description || "").trim(),
+      price: Number(item.price) || 0,
+      available: item.available !== false,
+    }))
+    .filter((item) => item.id && item.name && item.price > 0);
 }
 
 export async function resolveProviderBundle(carrier, gb) {
