@@ -15,16 +15,61 @@ import walletRoutes from "./walletRoutes.js";
 import paystackRoutes from "./paystackRoutes.js";
 import storefrontPaymentRoutes from "./storefrontPaymentRoutes.js";
 import { paystackWebhook } from "./paystackWebhook.js";
+import { createDatabaseReadyMiddleware } from "./middleware/databaseReady.js";
 import { notFound, errorHandler } from "./middleware/error.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+const IS_VERCEL = Boolean(process.env.VERCEL);
+
+let databaseConnectionPromise = null;
+let databaseInitialized = false;
+let databaseRetryTimer = null;
+
+async function connectDatabase() {
+  if (dbState() === "connected") return;
+  if (databaseConnectionPromise) return databaseConnectionPromise;
+
+  const uri = process.env.MONGODB_URI;
+  if (!uri) throw new Error("MONGODB_URI is not set");
+
+  databaseConnectionPromise = (async () => {
+    // Let a later invocation retry instead of keeping one serverless request in
+    // the long retry loop used by a normal always-on process.
+    await connectDB(uri, { retries: IS_VERCEL ? 0 : 4 });
+    console.log("✓ MongoDB connected");
+
+    if (!databaseInitialized) {
+      await ensureSuperadmin();
+      databaseInitialized = true;
+
+      // This is durable on an always-on host and best-effort per warm Vercel
+      // instance. The recovery work is idempotent, so overlapping warm
+      // instances cannot dispatch the same pending order twice.
+      startFulfilmentPoller();
+    }
+  })().finally(() => {
+    databaseConnectionPromise = null;
+  });
+
+  return databaseConnectionPromise;
+}
+
+const requireDatabase = createDatabaseReadyMiddleware({
+  connect: connectDatabase,
+  state: dbState,
+});
 
 app.use(cors({ origin: CLIENT_URL.split(",").map((s) => s.trim()), credentials: true }));
 // Signature verification needs the untouched bytes, so this route must be
 // registered before the global JSON parser.
-app.post("/api/paystack/webhook", express.raw({ type: "application/json", limit: "1mb" }), paystackWebhook);
+app.post(
+  "/api/paystack/webhook",
+  express.raw({ type: "application/json", limit: "1mb" }),
+  requireDatabase,
+  paystackWebhook
+);
 app.use(express.json());
 app.use(morgan("dev"));
 
@@ -41,6 +86,10 @@ app.get("/api/health", (req, res) => {
     time: new Date().toISOString(),
   });
 });
+
+// Authentication and every route below it query MongoDB. During a Vercel cold
+// start, wait for the shared connection before any Mongoose model can run.
+app.use("/api", requireDatabase);
 
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
@@ -61,49 +110,33 @@ process.on("unhandledRejection", (err) => {
   console.error("⚠ Unhandled rejection:", err?.message || err);
 });
 
-// Open the port FIRST, then reach for Mongo. Render (like most container
-// hosts) only marks a deploy live once the port is open and the health check
-// answers, and it kills the instance if that takes too long. connectDB spends
-// up to ~70s retrying an unreachable DSN, so connecting first held the port
-// shut past that window: the deploy failed and every request to the service
-// hung with no response at all. The API is worth serving before the DB is up —
-// /api/health reports `db` state, and the driver reconnects on its own.
-app.listen(PORT, () => {
-  console.log(`→ BuyDataNow API listening on port ${PORT}`);
-  console.log(`  CORS origin: ${CLIENT_URL}`);
-  console.log(`  Paystack: ${paystackConfigured() ? `${paystackMode()} mode` : "not configured"}`);
-  console.log(`  Fulfilment (Netpluse): ${netpluseStatus()}`);
-});
+// Vercel discovers the default export and runs it as one Fluid Compute
+// Function. Long-running hosts still use the normal port listener.
+if (!IS_VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`→ BuyDataNow API listening on port ${PORT}`);
+    console.log(`  CORS origin: ${CLIENT_URL}`);
+    console.log(`  Paystack: ${paystackConfigured() ? `${paystackMode()} mode` : "not configured"}`);
+    console.log(`  Fulfilment (Netpluse): ${netpluseStatus()}`);
+  });
+}
 
-let databaseRetryTimer = null;
+function handleDatabaseStartupFailure(err) {
+  console.error("✗ MongoDB connection failed:", err.message);
+  console.error("  DB routes return 503 until the connection succeeds.");
+  console.error("  Check MONGODB_URI and MongoDB Atlas Network Access.");
 
-async function connectDatabase() {
-  const uri = process.env.MONGODB_URI;
-  if (!uri) {
-    console.warn("⚠ MONGODB_URI is not set — add it to backend/.env. DB routes will error.");
-    return;
-  }
-  try {
-    await connectDB(uri);
-    databaseRetryTimer = null;
-    console.log("✓ MongoDB connected");
-    await ensureSuperadmin();
-    // Netpluse accepts orders as "processing" and delivers moments later, so poll
-    // the ones still in flight and settle (or refund) them.
-    startFulfilmentPoller();
-  } catch (err) {
-    if (!databaseRetryTimer) {
-      databaseRetryTimer = setTimeout(() => {
-        databaseRetryTimer = null;
-        void connectDatabase();
-      }, 30000);
-      databaseRetryTimer.unref?.();
-    }
-    console.error("✗ MongoDB connection failed:", err.message);
-    console.error("  The API is up, but DB routes will error until this is fixed.");
-    console.error("  On a hosted deploy this is usually the database firewall:");
-    console.error("  Atlas → Network Access must allow the host's outbound IPs.");
+  if (!IS_VERCEL && !databaseRetryTimer) {
+    databaseRetryTimer = setTimeout(() => {
+      databaseRetryTimer = null;
+      void connectDatabase().catch(handleDatabaseStartupFailure);
+    }, 30000);
+    databaseRetryTimer.unref?.();
   }
 }
 
-connectDatabase();
+// Start warming MongoDB immediately. A request arriving during the cold start
+// awaits this same promise through requireDatabase above.
+void connectDatabase().catch(handleDatabaseStartupFailure);
+
+export default app;
