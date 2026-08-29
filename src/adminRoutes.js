@@ -359,6 +359,7 @@ router.get("/overview", async (req, res, next) => {
     startToday.setHours(0, 0, 0, 0);
     const weekStart = new Date(startToday.getTime() - 6 * dayMs);
     const prevWeekStart = new Date(weekStart.getTime() - 7 * dayMs);
+    const countedOrderMatch = { status: { $nin: ["failed", "refunded"] } };
 
     const [
       agentsTotal,
@@ -383,6 +384,7 @@ router.get("/overview", async (req, res, next) => {
         { $group: { _id: null, wallet: { $sum: "$wallet" } } },
       ]),
       Order.aggregate([
+        { $match: countedOrderMatch },
         {
           $group: {
             _id: null,
@@ -390,13 +392,31 @@ router.get("/overview", async (req, res, next) => {
             agentEarnings: { $sum: { $ifNull: ["$earning", 0] } },
             platformRevenue: { $sum: { $subtract: ["$amount", { $ifNull: ["$earning", 0] }] } },
             platformMargin: { $sum: { $ifNull: ["$platformEarning", 0] } },
+            agentPortalMargin: {
+              $sum: {
+                $cond: [
+                  { $eq: [{ $ifNull: ["$store", ""] }, ""] },
+                  { $ifNull: ["$platformEarning", 0] },
+                  0,
+                ],
+              },
+            },
+            storefrontMargin: {
+              $sum: {
+                $cond: [
+                  { $ne: [{ $ifNull: ["$store", ""] }, ""] },
+                  { $ifNull: ["$platformEarning", 0] },
+                  0,
+                ],
+              },
+            },
             orders: { $sum: 1 },
             payingAgents: { $addToSet: "$agent" },
           },
         },
       ]),
       Order.aggregate([
-        { $match: { createdAt: { $gte: weekStart } } },
+        { $match: { ...countedOrderMatch, createdAt: { $gte: weekStart } } },
         {
           $group: {
             _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
@@ -405,11 +425,15 @@ router.get("/overview", async (req, res, next) => {
         },
       ]),
       Order.aggregate([
-        { $match: { createdAt: { $gte: prevWeekStart, $lt: weekStart } } },
+        { $match: { ...countedOrderMatch, createdAt: { $gte: prevWeekStart, $lt: weekStart } } },
         { $group: { _id: null, value: { $sum: "$amount" } } },
       ]),
-      Order.aggregate([{ $group: { _id: "$carrier", value: { $sum: "$amount" } } }]),
       Order.aggregate([
+        { $match: countedOrderMatch },
+        { $group: { _id: "$carrier", value: { $sum: "$amount" } } },
+      ]),
+      Order.aggregate([
+        { $match: countedOrderMatch },
         { $group: { _id: "$agent", volume: { $sum: "$amount" }, orders: { $sum: 1 } } },
         { $sort: { volume: -1 } },
         { $limit: 5 },
@@ -447,6 +471,8 @@ router.get("/overview", async (req, res, next) => {
       agentEarnings: 0,
       platformRevenue: 0,
       platformMargin: 0,
+      agentPortalMargin: 0,
+      storefrontMargin: 0,
       orders: 0,
       payingAgents: [],
     };
@@ -462,6 +488,11 @@ router.get("/overview", async (req, res, next) => {
           agentEarnings: money(totals.agentEarnings),
           platformRevenue: money(totals.platformRevenue),
           platformMargin: money(totals.platformMargin),
+          platformEarnings: {
+            total: money(totals.platformMargin),
+            agentPortal: money(totals.agentPortalMargin),
+            storefront: money(totals.storefrontMargin),
+          },
           orders: totals.orders,
           payingAgents: totals.payingAgents.length,
           pendingWithdrawals,

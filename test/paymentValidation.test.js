@@ -5,6 +5,7 @@ import { paymentMismatch } from "../src/lib/paymentValidation.js";
 import { customerPaystackCharge } from "../src/lib/paystackFee.js";
 import {
   canSetSellingPrice,
+  platformBundleMargin,
   storefrontMargins,
   walletPurchasePrice,
 } from "../src/lib/pricingPolicy.js";
@@ -76,6 +77,11 @@ test("charges superadmin wallet purchases at provider wholesale cost", () => {
     walletPurchasePrice({ role: "agent", providerCost: 4.4, platformPrice: 4.7 }),
     4.7
   );
+});
+
+test("calculates the superadmin margin on an agent portal purchase", () => {
+  assert.equal(platformBundleMargin({ platformPrice: 4.7, providerCost: 4.4 }), 0.3);
+  assert.equal(platformBundleMargin({ platformPrice: 4.2, providerCost: 4.4 }), 0);
 });
 
 test("charges a superadmin discount against platform margin", () => {

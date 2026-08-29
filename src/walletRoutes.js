@@ -6,7 +6,7 @@ import { requireAuth, publicAgent } from "./lib/auth.js";
 import { fulfilOrder } from "./lib/fulfilment.js";
 import { withMongoTransaction } from "./lib/mongoTransaction.js";
 import { netpluseCatalog, normalizePhone, validPhone } from "./lib/netpluseApi.js";
-import { walletPurchasePrice } from "./lib/pricingPolicy.js";
+import { platformBundleMargin, walletPurchasePrice } from "./lib/pricingPolicy.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -77,6 +77,7 @@ router.post("/spend", async (req, res, next) => {
     }
 
     let amount;
+    let platformMargin = 0;
     if (req.agent.role === "superadmin") {
       const catalog = await netpluseCatalog({ force: true, allowStale: false });
       const providerBundle = catalog.find(
@@ -98,6 +99,10 @@ router.post("/spend", async (req, res, next) => {
         agentPrice: own?.price,
         platformPrice: bundle.price,
       });
+      platformMargin = platformBundleMargin({
+        platformPrice: bundle.price,
+        providerCost: bundle.cost,
+      });
     }
 
     const booked = await withMongoTransaction(async (session) => {
@@ -109,6 +114,19 @@ router.post("/spend", async (req, res, next) => {
       if (!agent) return null;
 
       const ref = `DP-${randomUUID()}`;
+      const superadmin = platformMargin > 0
+        ? await Agent.findOne({ role: "superadmin" }).sort({ createdAt: 1 }).session(session)
+        : null;
+      const creditedPlatformMargin = superadmin ? platformMargin : 0;
+
+      if (superadmin && creditedPlatformMargin > 0) {
+        await Agent.updateOne(
+          { _id: superadmin._id },
+          { $inc: { wallet: creditedPlatformMargin } },
+          { session }
+        );
+      }
+
       const [transaction] = await Transaction.create(
         [
           {
@@ -133,16 +151,35 @@ router.post("/spend", async (req, res, next) => {
             bundle: `${gb} GB`,
             gb,
             amount,
+            platformEarning: creditedPlatformMargin,
             status: "pending",
             reversal: {
               agent: agent._id,
               agentName: agent.name,
               agentWalletAdjustment: amount,
+              platformWalletAdjustment: superadmin ? -creditedPlatformMargin : 0,
             },
           },
         ],
         { session, ordered: true }
       );
+
+      if (superadmin && creditedPlatformMargin > 0) {
+        await Transaction.create(
+          [
+            {
+              agentId: superadmin._id,
+              agent: superadmin.name,
+              type: "commission",
+              description: `Platform margin · agent purchase · ${network} ${gb}GB`,
+              amount: creditedPlatformMargin,
+              reference: `${ref}-platform`,
+            },
+          ],
+          { session, ordered: true }
+        );
+      }
+
       return { agent, transaction, order };
     });
 
