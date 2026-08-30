@@ -15,6 +15,7 @@ import net from "node:net";
 // nothing else to try and Atlas becomes unreachable. Set DNS_PIN=off to opt out
 // entirely and use the platform resolver only.
 const DNS_SERVERS = ["8.8.8.8", "1.1.1.1"];
+const DNS_OVER_HTTPS_URL = "https://dns.google/resolve";
 const pinDns = String(process.env.DNS_PIN || "").toLowerCase() !== "off";
 
 const resolver = new dns.Resolver();
@@ -35,9 +36,67 @@ function withPlatformFallback(api) {
     try {
       return await promiseResolver[api](hostname);
     } catch {
-      return platform(hostname);
+      try {
+        return await platform(hostname);
+      } catch (platformError) {
+        // Some Windows/corporate networks allow normal A lookups and HTTPS but
+        // reject the SRV/TXT DNS packets MongoDB Atlas requires. DNS-over-HTTPS
+        // preserves Atlas discovery on those networks without changing the URI.
+        try {
+          return await resolveWithDnsOverHttps(api, hostname);
+        } catch {
+          throw platformError;
+        }
+      }
     }
   };
+}
+
+async function resolveWithDnsOverHttps(api, hostname) {
+  const type = api === "resolveSrv" ? "SRV" : "TXT";
+  const url = `${DNS_OVER_HTTPS_URL}?name=${encodeURIComponent(hostname)}&type=${type}`;
+  const response = await fetch(url, {
+    headers: { accept: "application/dns-json" },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) throw new Error(`DNS-over-HTTPS failed (${response.status})`);
+
+  const payload = await response.json();
+  if (payload.Status !== 0 || !Array.isArray(payload.Answer)) {
+    throw new Error(`DNS-over-HTTPS returned status ${payload.Status}`);
+  }
+
+  return api === "resolveSrv"
+    ? parseDohSrvAnswers(payload.Answer)
+    : parseDohTxtAnswers(payload.Answer);
+}
+
+export function parseDohSrvAnswers(answers) {
+  return answers
+    .filter((answer) => answer.type === 33 && typeof answer.data === "string")
+    .map((answer) => {
+      const [priority, weight, port, ...nameParts] = answer.data.trim().split(/\s+/);
+      return {
+        priority: Number(priority),
+        weight: Number(weight),
+        port: Number(port),
+        name: nameParts.join(" ").replace(/\.$/, ""),
+      };
+    })
+    .filter((answer) => answer.name && Number.isFinite(answer.port));
+}
+
+export function parseDohTxtAnswers(answers) {
+  return answers
+    .filter((answer) => answer.type === 16 && typeof answer.data === "string")
+    .map((answer) => {
+      const chunks = [];
+      answer.data.replace(/"((?:\\.|[^"\\])*)"/g, (_match, chunk) => {
+        chunks.push(chunk.replace(/\\(.)/g, "$1"));
+        return _match;
+      });
+      return chunks.length ? chunks : [answer.data];
+    });
 }
 
 if (pinDns) {
