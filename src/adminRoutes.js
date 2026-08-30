@@ -14,6 +14,7 @@ import {
   Log,
 } from "./models/index.js";
 import { requireAdmin, hashPassword } from "./lib/auth.js";
+import { invalidateMaintenanceModeCache } from "./middleware/maintenanceMode.js";
 import { recordLog } from "./lib/audit.js";
 import { getSettings } from "./lib/settings.js";
 import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
@@ -628,6 +629,7 @@ router.put("/settings", async (req, res, next) => {
     s.whatsappAlerts = bool(b.whatsappAlerts, s.whatsappAlerts);
     s.smsAlerts = bool(b.smsAlerts, s.smsAlerts);
     await s.save();
+    invalidateMaintenanceModeCache();
 
     recordLog("info", `Platform settings updated · ${s.appName}`, "admin/settings");
     res.json({ data: s });

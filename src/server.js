@@ -16,6 +16,7 @@ import paystackRoutes from "./paystackRoutes.js";
 import storefrontPaymentRoutes from "./storefrontPaymentRoutes.js";
 import { paystackWebhook } from "./paystackWebhook.js";
 import { createDatabaseReadyMiddleware } from "./middleware/databaseReady.js";
+import { maintenanceMode } from "./middleware/maintenanceMode.js";
 import { notFound, errorHandler } from "./middleware/error.js";
 
 const app = express();
@@ -90,6 +91,7 @@ app.get("/api/health", (req, res) => {
 // Authentication and every route below it query MongoDB. During a Vercel cold
 // start, wait for the shared connection before any Mongoose model can run.
 app.use("/api", requireDatabase);
+app.use("/api", maintenanceMode);
 
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
