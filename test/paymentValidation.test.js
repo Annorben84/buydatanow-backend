@@ -4,9 +4,11 @@ import assert from "node:assert/strict";
 import { paymentMismatch } from "../src/lib/paymentValidation.js";
 import { customerPaystackCharge } from "../src/lib/paystackFee.js";
 import {
+  agentBundleMargin,
   canSetSellingPrice,
   platformBundleMargin,
   storefrontMargins,
+  walletPurchaseEconomics,
   walletPurchasePrice,
 } from "../src/lib/pricingPolicy.js";
 import {
@@ -84,6 +86,44 @@ test("calculates the superadmin margin on an agent portal purchase", () => {
   assert.equal(platformBundleMargin({ platformPrice: 4.2, providerCost: 4.4 }), 0);
 });
 
+test("credits only configured agent markup as Buy Data commission", () => {
+  assert.equal(
+    agentBundleMargin({ role: "agent", platformPrice: 4.7 }),
+    0,
+    "buying at the platform agent price earns no commission"
+  );
+  assert.equal(
+    agentBundleMargin({ role: "agent", agentPrice: 5.1, platformPrice: 4.7 }),
+    0.4,
+    "the configured markup becomes agent commission"
+  );
+  assert.equal(
+    agentBundleMargin({ role: "agent", agentPrice: 11, platformPrice: 8.65 }),
+    2.35,
+    "a 2 GB price raised from GHS 8.65 to GHS 11.00 earns GHS 2.35 commission"
+  );
+  assert.equal(
+    agentBundleMargin({ role: "superadmin", agentPrice: 5.1, platformPrice: 4.7 }),
+    0,
+    "superadmin wholesale purchases do not create agent commission"
+  );
+});
+
+test("keeps Buy Data commission and failure refunds balanced", () => {
+  assert.deepEqual(
+    walletPurchaseEconomics({ role: "agent", platformPrice: 4.7 }),
+    { amount: 4.7, agentMargin: 0, refundAmount: 4.7 }
+  );
+  assert.deepEqual(
+    walletPurchaseEconomics({ role: "agent", agentPrice: 5.1, platformPrice: 4.7 }),
+    { amount: 5.1, agentMargin: 0.4, refundAmount: 4.7 }
+  );
+  assert.deepEqual(
+    walletPurchaseEconomics({ role: "superadmin", providerCost: 4.4 }),
+    { amount: 4.4, agentMargin: 0, refundAmount: 4.4 }
+  );
+});
+
 test("charges a superadmin discount against platform margin", () => {
   assert.deepEqual(
     storefrontMargins({
@@ -107,6 +147,16 @@ test("splits a direct agent sale without crediting profit into the wallet", () =
   });
 
   assert.deepEqual(economics, { agentMargin: 0.4, platformMargin: 0.3 });
+  assert.equal(
+    storefrontMargins({
+      role: "agent",
+      sellingPrice: 11,
+      platformPrice: 8.65,
+      providerCost: 8,
+    }).agentMargin,
+    2.35,
+    "a portal or storefront 2 GB sale earns the same GHS 2.35 agent commission"
+  );
   assert.equal(platformPrice, 4.7, "the prepaid wallet debit is provider cost plus commission");
   assert.equal(
     Math.round((sellingPrice - platformPrice) * 100) / 100,

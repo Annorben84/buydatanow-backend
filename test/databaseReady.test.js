@@ -56,3 +56,25 @@ test("returns 503 and never runs the route when MongoDB cannot connect", async (
     error: "Database temporarily unavailable. Please try again shortly.",
   });
 });
+
+test("returns 503 promptly when MongoDB connection remains pending", async () => {
+  let nextCalled = false;
+  const response = responseDouble();
+  const errors = [];
+  const middleware = createDatabaseReadyMiddleware({
+    connect: () => new Promise(() => {}),
+    state: () => "connecting",
+    logger: { error: (...args) => errors.push(args.join(" ")) },
+    timeoutMs: 20,
+  });
+
+  const startedAt = Date.now();
+  await middleware({}, response, () => {
+    nextCalled = true;
+  });
+
+  assert.equal(nextCalled, false);
+  assert.equal(response.statusCode, 503);
+  assert.ok(Date.now() - startedAt < 250);
+  assert.match(errors[0], /timed out after 20ms/);
+});

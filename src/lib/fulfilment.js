@@ -158,13 +158,18 @@ async function settleFailed(order, message) {
 export async function reverseOrder(inputOrder) {
   if (inputOrder.reversedAt || !inputOrder.reversal?.agent) return false;
 
+  // A user cancellation has its own terminal state. Provider failures still
+  // settle as refunded, while a cancelled order remains visibly cancelled
+  // after the same accounting reversal is applied.
+  const reversedStatus = inputOrder.status === "cancelled" ? "cancelled" : "refunded";
+
   const reversed = await withMongoTransaction(async (session) => {
     const order = await Order.findOneAndUpdate(
       {
         _id: inputOrder._id,
         $or: [{ reversedAt: { $exists: false } }, { reversedAt: null }],
       },
-      { $set: { status: "refunded", reversedAt: new Date() } },
+      { $set: { status: reversedStatus, reversedAt: new Date() } },
       { new: true, session }
     );
     if (!order) return false;
@@ -271,25 +276,155 @@ export async function reverseOrder(inputOrder) {
   return reversed;
 }
 
+/**
+ * Ask Netpluse for one order's current state and reconcile the local record.
+ * This is shared by the background poller and the authenticated agent order
+ * view, so both paths apply exactly the same delivery/refund rules.
+ */
+export async function syncNetpluseOrder(inputOrder) {
+  let order = inputOrder;
+
+  if (order.status === "pending") {
+    await fulfilOrder(order);
+    order = await Order.findById(order._id);
+  }
+
+  if (!order || order.provider !== "netpluse") {
+    return {
+      checked: false,
+      ok: true,
+      status: order?.status || inputOrder.status,
+      message:
+        order?.provider === "simulated"
+          ? "This order was completed in simulated mode and was not sent to Netpluse."
+          : "This order has not been sent to Netpluse.",
+    };
+  }
+
+  if (!order.providerRef && order.status !== "processing") {
+    return {
+      checked: false,
+      ok: true,
+      status: order.status,
+      message: "This order does not have a Netpluse reference.",
+    };
+  }
+
+  const retryingPurchase = !order.providerRef;
+  const result = order.providerRef
+    ? await netpluseOrderStatus(order.providerRef)
+    : await netpluseBuyData({
+        ref: order.ref,
+        phone: order.phone,
+        carrier: order.carrier,
+        gb: order.gb,
+      });
+
+  if (!result.ok) {
+    if (order.status === "processing" && retryingPurchase && !result.indeterminate) {
+      order.providerMessage = result.message || "Netpluse rejected the retried order.";
+      await settleFailed(order, order.providerMessage);
+    }
+    return {
+      checked: true,
+      ok: false,
+      status: order.status,
+      message: result.message || "Could not read the live Netpluse order status.",
+    };
+  }
+
+  if (result.providerRef && !order.providerRef) order.providerRef = result.providerRef;
+  order.providerStatus = result.raw || result.status;
+  order.providerMessage = result.message || order.providerMessage;
+  order.providerCost = money(result.cost || order.providerCost || 0);
+  const liveOrder = {
+    network: result.network || order.carrier || "",
+    capacity: result.capacity || order.bundle || "",
+    createdAt: result.createdAt || null,
+  };
+
+  // Terminal local orders are queried for visibility, but never reversed or
+  // reopened by a later provider response. Only in-flight orders reconcile.
+  if (order.status !== "processing") {
+    await order.save();
+    return {
+      checked: true,
+      ok: true,
+      status: result.status,
+      raw: result.raw || result.status,
+      message: result.message || "Live status fetched from Netpluse.",
+      providerRef: order.providerRef,
+      ...liveOrder,
+    };
+  }
+
+  if (result.status === "processing") {
+    await order.save();
+    return {
+      checked: true,
+      ok: true,
+      status: order.status,
+      raw: result.raw || result.status,
+      message: result.message || "Netpluse is still processing this order.",
+      providerRef: order.providerRef,
+      ...liveOrder,
+    };
+  }
+
+  if (result.status === "completed") {
+    order.status = "completed";
+    order.deliveredAt = order.deliveredAt || new Date();
+    await order.save();
+    await markPaymentFulfilled(order);
+    return {
+      checked: true,
+      ok: true,
+      status: order.status,
+      raw: result.raw || result.status,
+      message: result.message || "Netpluse confirmed delivery.",
+      providerRef: order.providerRef,
+      ...liveOrder,
+    };
+  }
+
+  order.providerMessage = result.message || `Provider reported ${result.raw || "failed"}.`;
+  await settleFailed(order, order.providerMessage);
+  const settled = await Order.findById(order._id).lean();
+  return {
+    checked: true,
+    ok: true,
+    status: settled?.status || "failed",
+    raw: result.raw || result.status,
+    message: order.providerMessage,
+    providerRef: order.providerRef,
+    ...liveOrder,
+  };
+}
+
 /** Recover undispatched orders and reconcile Netpluse orders still in flight. */
 export async function syncPendingOrders({ limit = 50 } = {}) {
   const undispatched = await Order.find({ status: "pending" }).sort({ createdAt: 1 }).limit(limit);
   for (const order of undispatched) await fulfilOrder(order);
 
-  // A database outage during reversal must not leave a charged failed order
-  // stranded forever. Retry only the atomic internal reversal; the refund
-  // helper has its own one-time claim.
+  // A database outage during reversal must not leave a charged failed or
+  // cancelled order stranded forever. Retry only the atomic internal reversal;
+  // the refund helper has its own one-time claim.
   const unreversed = await Order.find({
-    status: "failed",
+    status: { $in: ["failed", "cancelled"] },
     "reversal.agent": { $exists: true, $ne: null },
     $or: [{ reversedAt: { $exists: false } }, { reversedAt: null }],
   })
     .sort({ createdAt: 1 })
     .limit(limit);
   for (const order of unreversed) await reverseOrder(order);
+  const unreversedFailures = unreversed.filter((order) => order.status === "failed").length;
 
   if (!netpluseLive()) {
-    return { checked: undispatched.length + unreversed.length, delivered: 0, failed: unreversed.length };
+    return {
+      checked: undispatched.length + unreversed.length,
+      delivered: 0,
+      failed: unreversedFailures,
+    };
   }
 
   const pending = await Order.find({ provider: "netpluse", status: "processing" })
@@ -299,53 +434,16 @@ export async function syncPendingOrders({ limit = 50 } = {}) {
   let delivered = 0;
   let failed = 0;
   for (const order of pending) {
-    const retryingPurchase = !order.providerRef;
-    const result = order.providerRef
-      ? await netpluseOrderStatus(order.providerRef)
-      : await netpluseBuyData({
-          ref: order.ref,
-          phone: order.phone,
-          carrier: order.carrier,
-          gb: order.gb,
-        });
-    if (!result.ok) {
-      if (retryingPurchase && !result.indeterminate) {
-        order.providerMessage = result.message || "Netpluse rejected the retried order.";
-        await settleFailed(order, order.providerMessage);
-        failed++;
-      }
-      continue;
-    }
-    if (result.status === "processing") {
-      if (!order.providerRef && result.providerRef) {
-        order.providerRef = result.providerRef;
-        order.providerStatus = result.status;
-        order.providerCost = money(result.cost || order.providerCost || 0);
-        await order.save();
-      }
-      continue;
-    }
-
-    if (!order.providerRef && result.providerRef) order.providerRef = result.providerRef;
-    order.providerStatus = result.raw || result.status;
-    if (result.status === "completed") {
-      order.status = "completed";
-      order.deliveredAt = new Date();
-      await order.save();
-      await markPaymentFulfilled(order);
-      delivered++;
-      continue;
-    }
-
-    order.providerMessage = result.message || `Provider reported ${result.raw || "failed"}.`;
-    await settleFailed(order, order.providerMessage);
-    failed++;
+    const before = order.status;
+    const result = await syncNetpluseOrder(order);
+    if (before === "processing" && result.status === "completed") delivered++;
+    if (before === "processing" && ["failed", "refunded"].includes(result.status)) failed++;
   }
 
   return {
     checked: pending.length + undispatched.length + unreversed.length,
     delivered,
-    failed: failed + unreversed.length,
+    failed: failed + unreversedFailures,
   };
 }
 

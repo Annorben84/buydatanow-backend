@@ -17,7 +17,7 @@ import { crudScoped } from "./lib/crudScoped.js";
 import { requireAuth } from "./lib/auth.js";
 import { recordLog } from "./lib/audit.js";
 import { paystack, paystackConfigured, paystackMode, clientOrigin } from "./lib/paystackApi.js";
-import { fulfilOrder } from "./lib/fulfilment.js";
+import { fulfilOrder, reverseOrder, syncNetpluseOrder } from "./lib/fulfilment.js";
 import { validPhone, normalizePhone } from "./lib/netpluseApi.js";
 import { canSetSellingPrice } from "./lib/pricingPolicy.js";
 import { getSettings, publicSettings } from "./lib/settings.js";
@@ -801,6 +801,10 @@ router.get("/earnings", async (req, res, next) => {
     const monthStart = new Date(startToday.getFullYear(), startToday.getMonth(), 1);
     const thirtyDayStart = new Date(startToday.getTime() - 29 * dayMs);
     const done = { agent: agentId, status: "completed" };
+    const commissionEligible = {
+      agent: agentId,
+      status: { $in: ["pending", "processing", "completed"] },
+    };
 
     const periodAggregate = (from, to) => {
       const createdAt = to ? { $gte: from, $lt: to } : { $gte: from };
@@ -811,6 +815,7 @@ router.get("/earnings", async (req, res, next) => {
     };
 
     const [
+      availableCommissionAgg,
       totalsAgg,
       todayAgg,
       sevenDayAgg,
@@ -820,6 +825,10 @@ router.get("/earnings", async (req, res, next) => {
       storeAgg,
       recent,
     ] = await Promise.all([
+      Order.aggregate([
+        { $match: commissionEligible },
+        { $group: { _id: null, earnings: { $sum: "$earning" } } },
+      ]),
       Order.aggregate([
         { $match: done },
         { $group: { _id: null, earnings: { $sum: "$earning" }, orders: { $sum: 1 } } },
@@ -866,6 +875,7 @@ router.get("/earnings", async (req, res, next) => {
       });
     }
 
+    const availableCommission = availableCommissionAgg[0]?.earnings || 0;
     const totals = totalsAgg[0] || { earnings: 0, orders: 0 };
     const today = todayAgg[0] || { earnings: 0, orders: 0 };
     const sevenDays = sevenDayAgg[0] || { earnings: 0, orders: 0 };
@@ -873,6 +883,7 @@ router.get("/earnings", async (req, res, next) => {
     const month = monthAgg[0] || { earnings: 0, orders: 0 };
     res.json({
       data: {
+        availableCommission: money(availableCommission),
         totalEarnings: money(totals.earnings),
         completedOrders: totals.orders,
         avgEarning: totals.orders > 0 ? money(totals.earnings / totals.orders) : 0,
@@ -903,6 +914,88 @@ router.get("/earnings", async (req, res, next) => {
 
 /* Per-tenant operational data (read-only lists for now). */
 router.get("/orders", crudScoped(Order).list);
+router.post("/orders/:ref/cancel", async (req, res, next) => {
+  try {
+    const identifier = String(req.params.ref || "").trim();
+    const identity = /^[a-f\d]{24}$/i.test(identifier)
+      ? { $or: [{ ref: identifier }, { _id: identifier }] }
+      : { ref: identifier };
+    const ownedOrder = await Order.findOne({ agent: req.agent._id, ...identity });
+    if (!ownedOrder) return res.status(404).json({ error: "Order not found" });
+
+    // Repeating a successful cancellation is harmless and gives retrying
+    // clients the settled order instead of a misleading conflict.
+    if (ownedOrder.status === "cancelled") {
+      if (!ownedOrder.reversedAt && ownedOrder.reversal?.agent) {
+        await reverseOrder(ownedOrder);
+      }
+      const settled = await Order.findById(ownedOrder._id);
+      return res.json({ data: { order: settled, cancelled: true } });
+    }
+    if (ownedOrder.status !== "pending") {
+      return res.status(409).json({
+        error: "This order can no longer be cancelled because fulfilment has already started.",
+      });
+    }
+    if (!ownedOrder.reversal?.agent) {
+      return res.status(409).json({
+        error: "This order cannot be cancelled automatically. Please contact support.",
+      });
+    }
+
+    // Compete atomically with fulfilOrder's pending -> processing claim. Only
+    // one can win, so cancellation can never refund an order sent upstream.
+    const claimed = await Order.findOneAndUpdate(
+      {
+        _id: ownedOrder._id,
+        agent: req.agent._id,
+        status: "pending",
+        "reversal.agent": { $exists: true, $ne: null },
+      },
+      {
+        $set: {
+          status: "cancelled",
+          providerStatus: "cancelled",
+          providerMessage: "Cancelled by the user before provider dispatch.",
+        },
+      },
+      { new: true }
+    );
+    if (!claimed) {
+      return res.status(409).json({
+        error: "This order can no longer be cancelled because fulfilment has already started.",
+      });
+    }
+
+    await reverseOrder(claimed);
+    const settled = await Order.findById(claimed._id);
+    recordLog(
+      "info",
+      `Order cancelled by user · ${claimed.ref} · ${claimed.carrier} ${claimed.gb}GB`,
+      "orders/cancel",
+      { agentId: String(req.agent._id) }
+    );
+    res.json({ data: { order: settled, cancelled: true } });
+  } catch (err) {
+    next(err);
+  }
+});
+router.post("/orders/:ref/live-status", async (req, res, next) => {
+  try {
+    const identifier = String(req.params.ref || "").trim();
+    const identity = /^[a-f\d]{24}$/i.test(identifier)
+      ? { $or: [{ ref: identifier }, { _id: identifier }] }
+      : { ref: identifier };
+    const order = await Order.findOne({ agent: req.agent._id, ...identity });
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    const live = await syncNetpluseOrder(order);
+    const updated = await Order.findById(order._id).lean();
+    res.json({ data: { order: updated, live } });
+  } catch (err) {
+    next(err);
+  }
+});
 router.get("/customers", crudScoped(Customer).list);
 router.get("/transactions", crudScoped(Transaction, "agentId").list);
 

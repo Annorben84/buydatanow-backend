@@ -62,7 +62,8 @@ API runs on `http://localhost:5000`. Check `http://localhost:5000/api/health`.
 | GET/PATCH/DELETE | `/api/stores/:id` | Read / update / delete a store |
 | GET/POST/PATCH/DELETE | `/api/bundles` | Data bundles (Pricing / Buy Data) |
 | GET/POST/PATCH/DELETE | `/api/agents` | Agents |
-| GET | `/api/orders` · `/api/customers` · `/api/transactions` | Read-only lists |
+| GET | `/api/orders` · `/api/customers` · `/api/transactions` | Tenant-scoped lists |
+| POST | `/api/orders/:ref/cancel` | Cancel an owned pending order before provider dispatch |
 | GET | `/api/admin/provider` | Fulfilment provider state + upstream wallet balance |
 | GET | `/api/admin/provider/catalog` | What Netpluse sells us, at our cost price |
 | POST | `/api/admin/provider/sync-costs` | Pull Netpluse prices into `Bundle.cost` (`{"dryRun":true}` to preview) |

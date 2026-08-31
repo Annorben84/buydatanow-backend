@@ -16,6 +16,7 @@ import net from "node:net";
 // entirely and use the platform resolver only.
 const DNS_SERVERS = ["8.8.8.8", "1.1.1.1"];
 const DNS_OVER_HTTPS_URL = "https://dns.google/resolve";
+const DNS_RESOLVE_TIMEOUT_MS = 2500;
 const pinDns = String(process.env.DNS_PIN || "").toLowerCase() !== "off";
 
 const resolver = new dns.Resolver();
@@ -29,24 +30,38 @@ try {
 
 const osLookup = dns.lookup;
 
-/** Pinned resolver first, platform resolver second. */
+function withTimeout(promise, timeoutMs = DNS_RESOLVE_TIMEOUT_MS) {
+  let timeoutId;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error(`DNS lookup timed out after ${timeoutMs}ms`)), timeoutMs);
+      timeoutId.unref?.();
+    }),
+  ]).finally(() => {
+    if (timeoutId) clearTimeout(timeoutId);
+  });
+}
+
+/** Try pinned and platform DNS briefly, then use DNS-over-HTTPS. */
 function withPlatformFallback(api) {
   const platform = dns.promises[api].bind(dns.promises);
   return async function resolveWithFallback(hostname) {
     try {
-      return await promiseResolver[api](hostname);
+      // Windows and some corporate resolvers can leave TXT/SRV promises pending
+      // indefinitely instead of rejecting. Bound both attempts so the working
+      // DNS-over-HTTPS fallback is always reachable.
+      return await withTimeout(
+        Promise.any([promiseResolver[api](hostname), platform(hostname)])
+      );
     } catch {
       try {
-        return await platform(hostname);
-      } catch (platformError) {
         // Some Windows/corporate networks allow normal A lookups and HTTPS but
         // reject the SRV/TXT DNS packets MongoDB Atlas requires. DNS-over-HTTPS
         // preserves Atlas discovery on those networks without changing the URI.
-        try {
-          return await resolveWithDnsOverHttps(api, hostname);
-        } catch {
-          throw platformError;
-        }
+        return await resolveWithDnsOverHttps(api, hostname);
+      } catch (dohError) {
+        throw dohError;
       }
     }
   };

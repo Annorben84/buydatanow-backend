@@ -6,7 +6,10 @@ import { requireAuth, publicAgent } from "./lib/auth.js";
 import { fulfilOrder } from "./lib/fulfilment.js";
 import { withMongoTransaction } from "./lib/mongoTransaction.js";
 import { netpluseCatalog, normalizePhone, validPhone } from "./lib/netpluseApi.js";
-import { platformBundleMargin, walletPurchasePrice } from "./lib/pricingPolicy.js";
+import {
+  platformBundleMargin,
+  walletPurchaseEconomics,
+} from "./lib/pricingPolicy.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -77,6 +80,8 @@ router.post("/spend", async (req, res, next) => {
     }
 
     let amount;
+    let agentMargin = 0;
+    let refundAmount;
     let platformMargin = 0;
     if (req.agent.role === "superadmin") {
       const catalog = await netpluseCatalog({ force: true, allowStale: false });
@@ -86,19 +91,19 @@ router.post("/spend", async (req, res, next) => {
       if (!providerBundle) {
         return res.status(400).json({ error: "That bundle is not listed by Netpluse." });
       }
-      amount = walletPurchasePrice({
+      ({ amount, agentMargin, refundAmount } = walletPurchaseEconomics({
         role: req.agent.role,
         providerCost: providerBundle.cost,
-      });
+      }));
     } else {
       const bundle = await Bundle.findOne({ carrier: network, gb, active: true }).lean();
       if (!bundle) return res.status(400).json({ error: "That bundle isn't available." });
       const own = await AgentPrice.findOne({ agent: req.agent._id, carrier: network, gb }).lean();
-      amount = walletPurchasePrice({
+      ({ amount, agentMargin, refundAmount } = walletPurchaseEconomics({
         role: req.agent.role,
         agentPrice: own?.price,
         platformPrice: bundle.price,
-      });
+      }));
       platformMargin = platformBundleMargin({
         platformPrice: bundle.price,
         providerCost: bundle.cost,
@@ -127,17 +132,36 @@ router.post("/spend", async (req, res, next) => {
         );
       }
 
+      if (agentMargin > 0) {
+        await Agent.updateOne(
+          { _id: agent._id },
+          { $inc: { wallet: agentMargin } },
+          { session }
+        );
+      }
+
+      const ledgerEntries = [
+        {
+          agentId: agent._id,
+          agent: agent.name,
+          type: "purchase",
+          description: `${network} ${gb}GB · data purchase · ${phone}`,
+          amount: -amount,
+          reference: `${ref}-purchase`,
+        },
+      ];
+      if (agentMargin > 0) {
+        ledgerEntries.push({
+          agentId: agent._id,
+          agent: agent.name,
+          type: "commission",
+          description: `Sale margin · agent purchase · ${network} ${gb}GB`,
+          amount: agentMargin,
+          reference: `${ref}-margin`,
+        });
+      }
       const [transaction] = await Transaction.create(
-        [
-          {
-            agentId: agent._id,
-            agent: agent.name,
-            type: "purchase",
-            description: `${network} ${gb}GB · data purchase · ${phone}`,
-            amount: -amount,
-            reference: `${ref}-purchase`,
-          },
-        ],
+        ledgerEntries,
         { session, ordered: true }
       );
       const [order] = await Order.create(
@@ -151,12 +175,15 @@ router.post("/spend", async (req, res, next) => {
             bundle: `${gb} GB`,
             gb,
             amount,
+            earning: agentMargin,
             platformEarning: creditedPlatformMargin,
             status: "pending",
             reversal: {
               agent: agent._id,
               agentName: agent.name,
-              agentWalletAdjustment: amount,
+              // The margin was credited above, so a failed order returns only
+              // the net platform cost. Purchase + commission + refund then sum to zero.
+              agentWalletAdjustment: refundAmount,
               platformWalletAdjustment: superadmin ? -creditedPlatformMargin : 0,
             },
           },

@@ -1,6 +1,57 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+test("checks an order with the documented Netpluse reference endpoint", async () => {
+  const originalKey = process.env.NETPLUSE_API_KEY;
+  const originalBase = process.env.NETPLUSE_BASE_URL;
+  const originalFetch = global.fetch;
+  let request;
+
+  process.env.NETPLUSE_API_KEY = "np_test_order_status";
+  process.env.NETPLUSE_BASE_URL = "https://netpluse.shop/api/v1";
+  global.fetch = async (url, options) => {
+    request = { url, options };
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        reference: "NPAPI-1234-abc",
+        network: "MTN",
+        capacity: "1GB",
+        status: "completed",
+        createdAt: "2026-06-15T10:24:00.000Z",
+      }),
+    };
+  };
+
+  try {
+    const { netpluseOrderStatus } = await import(
+      `../src/lib/netpluseApi.js?order-status-test=${Date.now()}`
+    );
+    const result = await netpluseOrderStatus("NPAPI-1234-abc");
+
+    assert.equal(request.url, "https://netpluse.shop/api/v1/order-status/NPAPI-1234-abc");
+    assert.equal(request.options.headers["x-api-key"], "np_test_order_status");
+    assert.deepEqual(result, {
+      ok: true,
+      providerRef: "NPAPI-1234-abc",
+      status: "completed",
+      raw: "completed",
+      network: "MTN",
+      capacity: "1GB",
+      createdAt: "2026-06-15T10:24:00.000Z",
+      message: "",
+      cost: 0,
+    });
+  } finally {
+    global.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.NETPLUSE_API_KEY;
+    else process.env.NETPLUSE_API_KEY = originalKey;
+    if (originalBase === undefined) delete process.env.NETPLUSE_BASE_URL;
+    else process.env.NETPLUSE_BASE_URL = originalBase;
+  }
+});
+
 test("live-only catalog reads never fall back to cached Netpluse costs", async () => {
   const originalKey = process.env.NETPLUSE_API_KEY;
   const originalFetch = global.fetch;

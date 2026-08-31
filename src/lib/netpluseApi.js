@@ -254,6 +254,9 @@ export async function netpluseOrderStatus(providerRef) {
     providerRef: String(data?.reference || providerRef),
     status: mapProviderStatus(raw),
     raw,
+    network: String(data?.network || ""),
+    capacity: String(data?.capacity || ""),
+    createdAt: data?.createdAt ? String(data.createdAt) : null,
     message: String(data?.message || ""),
     cost: Number(data?.price) || 0,
   };

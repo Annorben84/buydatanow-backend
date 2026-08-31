@@ -360,7 +360,7 @@ router.get("/overview", async (req, res, next) => {
     startToday.setHours(0, 0, 0, 0);
     const weekStart = new Date(startToday.getTime() - 6 * dayMs);
     const prevWeekStart = new Date(weekStart.getTime() - 7 * dayMs);
-    const countedOrderMatch = { status: { $nin: ["failed", "refunded"] } };
+    const countedOrderMatch = { status: { $nin: ["failed", "refunded", "cancelled"] } };
 
     const [
       agentsTotal,
