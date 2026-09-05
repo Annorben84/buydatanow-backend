@@ -4,12 +4,11 @@ import assert from "node:assert/strict";
 import { paymentMismatch } from "../src/lib/paymentValidation.js";
 import { customerPaystackCharge } from "../src/lib/paystackFee.js";
 import {
-  agentBundleMargin,
   canSetSellingPrice,
   platformBundleMargin,
+  portalPurchaseEconomics,
+  portalPurchasePrice,
   storefrontMargins,
-  walletPurchaseEconomics,
-  walletPurchasePrice,
 } from "../src/lib/pricingPolicy.js";
 import {
   capacityInGb,
@@ -65,18 +64,17 @@ test("allows only superadmins to set a selling price below platform price", () =
   assert.equal(canSetSellingPrice("superadmin", 4.5, 4.7), true);
 });
 
-test("charges superadmin wallet purchases at provider wholesale cost", () => {
+test("charges superadmin portal purchases at provider wholesale cost", () => {
   assert.equal(
-    walletPurchasePrice({
+    portalPurchasePrice({
       role: "superadmin",
       providerCost: 4.4,
-      agentPrice: 5.1,
       platformPrice: 4.7,
     }),
     4.4
   );
   assert.equal(
-    walletPurchasePrice({ role: "agent", providerCost: 4.4, platformPrice: 4.7 }),
+    portalPurchasePrice({ role: "agent", providerCost: 4.4, platformPrice: 4.7 }),
     4.7
   );
 });
@@ -86,41 +84,14 @@ test("calculates the superadmin margin on an agent portal purchase", () => {
   assert.equal(platformBundleMargin({ platformPrice: 4.2, providerCost: 4.4 }), 0);
 });
 
-test("keeps agent-portal purchases separate from storefront commission", () => {
-  assert.equal(
-    agentBundleMargin({ role: "agent", platformPrice: 4.7 }),
-    0,
-    "buying at the platform agent price earns no commission"
-  );
-  assert.equal(
-    agentBundleMargin({ role: "agent", agentPrice: 5.1, platformPrice: 4.7 }),
-    0,
-    "a storefront selling price does not create commission on a portal purchase"
-  );
-  assert.equal(
-    agentBundleMargin({ role: "agent", agentPrice: 11, platformPrice: 8.65 }),
-    0,
-    "portal purchases never create withdrawable commission"
-  );
-  assert.equal(
-    agentBundleMargin({ role: "superadmin", agentPrice: 5.1, platformPrice: 4.7 }),
-    0,
-    "superadmin wholesale purchases do not create agent commission"
-  );
-});
-
-test("charges and refunds the platform price for agent Buy Data purchases", () => {
+test("prices Paystack portal purchases without creating agent commission", () => {
   assert.deepEqual(
-    walletPurchaseEconomics({ role: "agent", platformPrice: 4.7 }),
-    { amount: 4.7, agentMargin: 0, refundAmount: 4.7 }
+    portalPurchaseEconomics({ role: "agent", platformPrice: 4.7, providerCost: 4.4 }),
+    { amount: 4.7, agentMargin: 0, platformMargin: 0.3 }
   );
   assert.deepEqual(
-    walletPurchaseEconomics({ role: "agent", agentPrice: 5.1, platformPrice: 4.7 }),
-    { amount: 4.7, agentMargin: 0, refundAmount: 4.7 }
-  );
-  assert.deepEqual(
-    walletPurchaseEconomics({ role: "superadmin", providerCost: 4.4 }),
-    { amount: 4.4, agentMargin: 0, refundAmount: 4.4 }
+    portalPurchaseEconomics({ role: "superadmin", providerCost: 4.4, platformPrice: 4.7 }),
+    { amount: 4.4, agentMargin: 0, platformMargin: 0 }
   );
 });
 
@@ -201,6 +172,31 @@ test("validates every storefront fulfilment field", () => {
   assert.match(
     paymentMismatch(intent, { ...payment, metadata: { ...payment.metadata, phone: "0550000000" } }),
     /recipient/i
+  );
+});
+
+test("validates every authenticated portal fulfilment field", () => {
+  const intent = {
+    ...walletIntent,
+    purpose: "portal_order",
+    network: "Telecel",
+    gb: 10,
+    phone: "0200000000",
+  };
+  const payment = {
+    ...walletPayment,
+    metadata: {
+      purpose: "portal_order",
+      agentId: "agent-1",
+      network: "Telecel",
+      gb: 10,
+      phone: "0200000000",
+    },
+  };
+  assert.equal(paymentMismatch(intent, payment), "");
+  assert.match(
+    paymentMismatch(intent, { ...payment, metadata: { ...payment.metadata, gb: 5 } }),
+    /bundle/i
   );
 });
 

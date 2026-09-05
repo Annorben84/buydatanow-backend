@@ -24,9 +24,11 @@ export function paymentMismatch(intent, data) {
   if (asText(metadata.purpose) !== asText(intent.purpose)) return "Payment purpose mismatch.";
   if (asText(metadata.agentId) !== asText(intent.agent)) return "Payment account mismatch.";
 
-  if (intent.purpose === "storefront_order") {
-    if (asText(metadata.storeSlug).toLowerCase() !== asText(intent.storeSlug).toLowerCase()) {
-      return "Payment store mismatch.";
+  if (["storefront_order", "portal_order"].includes(intent.purpose)) {
+    if (intent.purpose === "storefront_order") {
+      if (asText(metadata.storeSlug).toLowerCase() !== asText(intent.storeSlug).toLowerCase()) {
+        return "Payment store mismatch.";
+      }
     }
     if (asText(metadata.network) !== asText(intent.network)) return "Payment network mismatch.";
     if (Number(metadata.gb) !== Number(intent.gb)) return "Payment bundle mismatch.";

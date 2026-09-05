@@ -130,8 +130,15 @@ router.post("/commission-transfer", async (req, res, next) => {
   }
 });
 
-/** Book a wallet-funded data order atomically, then dispatch it to Netpluse. */
-router.post("/spend", async (req, res, next) => {
+/** Portal data purchases must be proven by Paystack before fulfilment. */
+router.post("/spend", (_req, res) => {
+  res.status(410).json({
+    error: "Wallet purchases are disabled. Continue through the secure Paystack checkout.",
+  });
+});
+
+/** Retained only as migration context for pre-Paystack wallet orders. */
+if (false) router.post("/spend", async (req, res, next) => {
   try {
     const network = String(req.body.network || "").trim();
     const gb = Number(req.body.gb) || 0;

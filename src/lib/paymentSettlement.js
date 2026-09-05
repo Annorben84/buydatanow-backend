@@ -34,7 +34,7 @@ function publicStatus(payment) {
 
 /**
  * Atomically settle a Paystack success exactly once, then dispatch a newly
- * booked storefront order to Netpluse outside the database transaction.
+ * booked storefront or portal order to Netpluse outside the database transaction.
  */
 export async function settleVerifiedPayment(reference, gatewayData) {
   const transactionResult = await withMongoTransaction(async (session) => {
@@ -156,6 +156,50 @@ export async function settleVerifiedPayment(reference, gatewayData) {
       claimed.settledAt = new Date();
       await claimed.save({ session });
       return { action: "wallet", paymentId: claimed._id, agentId: agent._id };
+    }
+
+    if (claimed.purpose === "portal_order") {
+      const agent = await Agent.findById(claimed.agent).session(session);
+      if (!agent) {
+        claimed.status = "failed";
+        claimed.failureReason = "The purchasing account no longer exists.";
+        await claimed.save({ session });
+        return { action: "mismatch", paymentId: claimed._id, mismatch: claimed.failureReason };
+      }
+
+      const [order] = await Order.create(
+        [
+          {
+            agent: agent._id,
+            ref: claimed.reference,
+            customer: claimed.phone,
+            phone: claimed.phone,
+            carrier: claimed.network,
+            bundle: `${claimed.gb} GB`,
+            gb: claimed.gb,
+            amount: claimed.amount,
+            earning: 0,
+            platformEarning: claimed.platformMargin,
+            status: "pending",
+            paymentProvider: "paystack",
+            paymentReference: claimed.reference,
+            settlementModel: "platform_collected",
+            reversal: {
+              agent: agent._id,
+              agentName: agent.name,
+              agentWalletAdjustment: 0,
+              platformWalletAdjustment: 0,
+            },
+          },
+        ],
+        { session, ordered: true }
+      );
+
+      claimed.status = "fulfilling";
+      claimed.order = order._id;
+      claimed.settledAt = new Date();
+      await claimed.save({ session });
+      return { action: "fulfil", paymentId: claimed._id, agentId: agent._id, orderId: order._id };
     }
 
     if (claimed.settlementModel === "agent_wallet_debit") {

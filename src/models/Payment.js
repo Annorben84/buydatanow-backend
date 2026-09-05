@@ -13,7 +13,11 @@ const PaymentSchema = new Schema(
   {
     reference: { type: String, required: true, unique: true, index: true },
     provider: { type: String, enum: ["paystack", "agent_direct"], default: "paystack" },
-    purpose: { type: String, enum: ["wallet_topup", "storefront_order"], required: true },
+    purpose: {
+      type: String,
+      enum: ["wallet_topup", "storefront_order", "portal_order"],
+      required: true,
+    },
     status: {
       type: String,
       enum: [

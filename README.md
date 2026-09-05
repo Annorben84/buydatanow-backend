@@ -58,6 +58,9 @@ API runs on `http://localhost:5000`. Check `http://localhost:5000/api/health`.
 | POST | `/api/payments/:reference/confirm` | Resolve a legacy manual-payment claim |
 | POST | `/api/payments/:reference/reject` | Reject a legacy manual-payment claim |
 | POST | `/api/wallet/paystack/init` and `/verify` | Verified agent wallet top-up |
+| POST | `/api/wallet/paystack/purchase/init` | Authenticated agent/admin Paystack MoMo purchase |
+| GET | `/api/wallet/paystack/purchase/status/:reference` | Owned portal payment/order status |
+| POST | `/api/wallet/spend` | Disabled legacy wallet-purchase endpoint |
 | POST | `/api/wallet/commission-transfer` | Move available commission into the spendable wallet |
 | POST | `/api/wallet/withdraw` | Hold available commission for owner-paid payout |
 | POST | `/api/paystack/webhook` | Signed Paystack event receiver |
@@ -75,9 +78,10 @@ All responses are `{ "data": ... }`. Errors are `{ "error": "..." }`.
 
 ## Storefront payment model
 
-Paystack is used for agent wallet top-ups and hosted storefront Mobile Money
-checkout. Both payment types settle into the platform Paystack account. Stores
-do not create or use Paystack subaccounts.
+Paystack is used for wallet top-ups and hosted Mobile Money checkout from both
+storefronts and the authenticated agent/superadmin portals. Every Paystack
+payment settles into the platform account. Stores do not create or use Paystack
+subaccounts.
 
 1. A customer selects a bundle and enters only the phone number that should
    receive the data. A receipt email is optional.
@@ -95,10 +99,16 @@ do not create or use Paystack subaccounts.
    Payout requests move commission to `commissionHeld`; the platform owner pays
    externally and records the payout reference when approving.
 
-The agent's selling-price margin is **not** credited to the platform wallet;
-the agent already received it as part of the customer's direct payment. Payment
-records retain `verificationMode` and `settlementModel`, keeping gateway-verified
-MoMo and agent-confirmed bank transfers on the same accounting model.
+Portal Buy Data purchases never debit the internal wallet: agents pay the
+platform catalog price through Paystack, while superadmins pay the live provider
+cost. Paystack collects the payer's Mobile Money number and PIN authorization on
+its hosted checkout. The app stores only the data recipient number and never
+asks for or stores a Mobile Money PIN.
+
+Storefront commission is released to the agent only after delivery. Portal
+purchases do not create agent commission. Payment records retain
+`verificationMode` and `settlementModel`, keeping gateway-verified MoMo and
+legacy agent-confirmed transfers on the same accounting model.
 
 ## Deploying
 

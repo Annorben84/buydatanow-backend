@@ -23,7 +23,7 @@ import {
 const money = (n) => Math.round(Number(n) * 100) / 100;
 
 /**
- * Release platform-collected storefront earnings only after confirmed delivery.
+ * Release platform-collected order earnings only after confirmed delivery.
  * The order claim makes this safe across callbacks, polling, and retries.
  */
 export async function settleCompletedOrderEarnings(inputOrder) {
@@ -52,6 +52,7 @@ export async function settleCompletedOrderEarnings(inputOrder) {
     if (!agent) throw new Error(`Cannot settle earnings for ${order.ref}: agent not found.`);
 
     const rows = [];
+    const saleLabel = order.store || "Portal purchase";
     const payment = order.paymentReference
       ? await Payment.findOne({ reference: order.paymentReference }).session(session)
       : null;
@@ -74,7 +75,7 @@ export async function settleCompletedOrderEarnings(inputOrder) {
         agent: agent.name,
         store: order.store,
         type: "commission",
-        description: `Storefront commission earned · ${order.carrier} ${order.gb}GB`,
+        description: `${saleLabel} commission earned · ${order.carrier} ${order.gb}GB`,
         amount: agentMargin,
         reference: `${order.ref}-margin`,
       });
@@ -104,7 +105,7 @@ export async function settleCompletedOrderEarnings(inputOrder) {
           agent: superadmin.name,
           store: order.store,
           type: platformMargin > 0 ? "commission" : "fee",
-          description: `${platformMargin > 0 ? "Platform margin" : "Platform price subsidy"} · ${order.store} · ${order.carrier} ${order.gb}GB`,
+          description: `${platformMargin > 0 ? "Platform margin" : "Platform price subsidy"} · ${saleLabel} · ${order.carrier} ${order.gb}GB`,
           amount: platformMargin,
           reference: `${order.ref}-${platformMargin > 0 ? "platform" : "platform-subsidy"}`,
         });
@@ -115,7 +116,7 @@ export async function settleCompletedOrderEarnings(inputOrder) {
           agent: superadmin.name,
           store: order.store,
           type: "fee",
-          description: `Paystack fee paid by customer · ${order.store}`,
+          description: `Paystack fee paid by customer · ${saleLabel}`,
           amount: feeRecovery,
           reference: `${order.ref}-paystack-fee-recovery`,
         });
@@ -126,7 +127,7 @@ export async function settleCompletedOrderEarnings(inputOrder) {
           agent: superadmin.name,
           store: order.store,
           type: "fee",
-          description: `Paystack fee · ${order.store}`,
+          description: `Paystack fee · ${saleLabel}`,
           amount: -gatewayFee,
           reference: `${order.ref}-paystack-fee`,
         });

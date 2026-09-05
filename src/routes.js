@@ -1007,7 +1007,8 @@ router.get("/payments", async (req, res, next) => {
         provider: p.provider,
         paymentMethod: p.paymentMethod || "",
         customerReference: p.customerReference || "",
-        walletDebit: money(p.platformPrice || 0),
+        walletDebit:
+          p.settlementModel === "agent_wallet_debit" ? money(p.platformPrice || 0) : 0,
         network: p.network || "",
         gb: p.gb || 0,
         gatewayChannel: p.gatewayChannel || "",

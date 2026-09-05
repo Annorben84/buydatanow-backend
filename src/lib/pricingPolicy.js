@@ -5,26 +5,29 @@ export function canSetSellingPrice(role, sellingPrice, platformPrice) {
   return role === "superadmin" || money(sellingPrice) >= money(platformPrice);
 }
 
-/** Superadmins buy at provider cost; agents spend the platform catalog price. */
-export function walletPurchasePrice({ role, providerCost, agentPrice, platformPrice }) {
+/** Superadmins pay provider cost; agents pay the platform catalog price. */
+export function portalPurchasePrice({ role, providerCost, platformPrice }) {
   if (role === "superadmin") return money(providerCost);
   return money(platformPrice);
 }
 
-/** Portal wallet purchases do not earn storefront commission. */
-export function agentBundleMargin() {
-  return 0;
-}
-
-/** Complete wallet accounting for an agent-portal data purchase. */
-export function walletPurchaseEconomics(options) {
-  const amount = walletPurchasePrice(options);
-  const agentMargin = agentBundleMargin(options);
+/** Trusted pricing for a Paystack purchase started from an authenticated portal. */
+export function portalPurchaseEconomics(options) {
+  const amount = portalPurchasePrice(options);
   return {
     amount,
-    agentMargin,
-    refundAmount: amount,
+    agentMargin: 0,
+    platformMargin:
+      options.role === "superadmin"
+        ? 0
+        : platformBundleMargin(options),
   };
+}
+
+/** Legacy shape retained for reading pre-Paystack wallet-order code. */
+export function walletPurchaseEconomics(options) {
+  const { amount, agentMargin } = portalPurchaseEconomics(options);
+  return { amount, agentMargin, refundAmount: amount };
 }
 
 /** App-owner commission on a bundle sold through the agent purchase portal. */

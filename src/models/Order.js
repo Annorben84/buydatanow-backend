@@ -33,8 +33,7 @@ const OrderSchema = new Schema(
     providerCost: { type: Number, default: 0 }, // what the provider charged us
     deliveredAt: { type: Date },
 
-    // The gateway payment behind a public storefront order. Wallet-funded
-    // agent purchases leave these blank.
+    // The gateway payment behind a public storefront or authenticated portal order.
     paymentProvider: { type: String, default: "" },
     paymentReference: { type: String, index: true, sparse: true },
     settlementModel: {
