@@ -13,6 +13,7 @@ const ReportSchema = new Schema(
     reference: { type: String, required: true, unique: true, trim: true },
     name: { type: String, required: true, trim: true },
     phone: { type: String, default: "", trim: true },
+    phoneNormalized: { type: String, default: "", trim: true, index: true },
     email: { type: String, default: "", trim: true, lowercase: true },
     orderRef: { type: String, default: "", trim: true },
     category: { type: String, required: true, trim: true },

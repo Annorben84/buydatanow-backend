@@ -3,9 +3,9 @@ import mongoose from "mongoose";
 const { Schema, model } = mongoose;
 
 /**
- * An agent's payout request. Funds are HELD (deducted from the wallet) when
- * the request is created; approving logs the payout transaction, rejecting
- * refunds the wallet.
+ * An agent's payout request. Commission is moved from available to held when
+ * requested. Approval records the owner's external payment; rejection releases
+ * the hold back to available commission.
  */
 const WithdrawalSchema = new Schema(
   {
@@ -15,6 +15,7 @@ const WithdrawalSchema = new Schema(
     method: { type: String, default: "" }, // e.g. "MTN MoMo", "Bank transfer"
     destination: { type: String, default: "" }, // account / phone number
     status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
+    payoutReference: { type: String, default: "" },
     decidedAt: { type: Date },
   },
   { timestamps: true }

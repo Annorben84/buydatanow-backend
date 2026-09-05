@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Router } from "express";
 
-import { Agent, AgentPrice, Bundle, Order, Transaction, Withdrawal } from "./models/index.js";
+import { Agent, Bundle, Order, Transaction, Withdrawal } from "./models/index.js";
 import { requireAuth, publicAgent } from "./lib/auth.js";
 import { fulfilOrder } from "./lib/fulfilment.js";
 import { withMongoTransaction } from "./lib/mongoTransaction.js";
@@ -29,7 +29,7 @@ router.post("/fund", (_req, res) => {
   });
 });
 
-/** Hold withdrawal funds and create the request as one atomic operation. */
+/** Move available commission to a payout hold and create the request atomically. */
 router.post("/withdraw", async (req, res, next) => {
   try {
     const amount = readAmount(req.body);
@@ -39,8 +39,8 @@ router.post("/withdraw", async (req, res, next) => {
 
     const result = await withMongoTransaction(async (session) => {
       const agent = await Agent.findOneAndUpdate(
-        { _id: req.agent._id, wallet: { $gte: amount } },
-        { $inc: { wallet: -amount } },
+        { _id: req.agent._id, commissionAvailable: { $gte: amount } },
+        { $inc: { commissionAvailable: -amount, commissionHeld: amount } },
         { new: true, session }
       );
       if (!agent) return null;
@@ -51,7 +51,7 @@ router.post("/withdraw", async (req, res, next) => {
       return { agent, withdrawal };
     });
 
-    if (!result) return res.status(400).json({ error: "Amount exceeds your wallet balance." });
+    if (!result) return res.status(400).json({ error: "Amount exceeds your available commission." });
     res.status(201).json({
       data: { agent: publicAgent(result.agent), withdrawal: result.withdrawal },
     });
@@ -64,6 +64,67 @@ router.get("/withdrawals", async (req, res, next) => {
   try {
     const docs = await Withdrawal.find({ agent: req.agent._id }).sort({ createdAt: -1 }).lean();
     res.json({ data: docs });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Move available commission into the agent's spendable wallet. */
+router.post("/commission-transfer", async (req, res, next) => {
+  try {
+    const amount = readAmount(req.body);
+    if (amount === null) return res.status(400).json({ error: "Enter a valid amount." });
+
+    const result = await withMongoTransaction(async (session) => {
+      const agent = await Agent.findOneAndUpdate(
+        { _id: req.agent._id, commissionAvailable: { $gte: amount } },
+        {
+          $inc: {
+            wallet: amount,
+            commissionAvailable: -amount,
+          },
+        },
+        { new: true, session }
+      );
+      if (!agent) return null;
+
+      const reference = `COMMISSION-TRANSFER-${randomUUID()}`;
+      const [transaction] = await Transaction.create(
+        [
+          {
+            agentId: agent._id,
+            agent: agent.name,
+            type: "commission_transfer",
+            description: "Commission transferred to Balance Left",
+            amount,
+            reference,
+          },
+        ],
+        { session, ordered: true }
+      );
+
+      return {
+        agent,
+        transaction,
+        availableCommission: money(agent.commissionAvailable || 0),
+        transferableCommission: money(agent.commissionAvailable || 0),
+      };
+    });
+
+    if (!result) {
+      return res.status(400).json({
+        error: "Amount exceeds your available commission.",
+      });
+    }
+
+    res.status(201).json({
+      data: {
+        agent: publicAgent(result.agent),
+        transaction: result.transaction,
+        availableCommission: result.availableCommission,
+        transferableCommission: result.transferableCommission,
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -98,10 +159,8 @@ router.post("/spend", async (req, res, next) => {
     } else {
       const bundle = await Bundle.findOne({ carrier: network, gb, active: true }).lean();
       if (!bundle) return res.status(400).json({ error: "That bundle isn't available." });
-      const own = await AgentPrice.findOne({ agent: req.agent._id, carrier: network, gb }).lean();
       ({ amount, agentMargin, refundAmount } = walletPurchaseEconomics({
         role: req.agent.role,
-        agentPrice: own?.price,
         platformPrice: bundle.price,
       }));
       platformMargin = platformBundleMargin({

@@ -33,9 +33,8 @@ const PaymentSchema = new Schema(
       default: "initialized",
       index: true,
     },
-    // `amount` is the product/top-up principal. For Paystack wallet top-ups,
-    // `chargedAmount` includes the customer-paid gateway fee. Direct storefront
-    // payments have no platform charge, so the two amounts are equal.
+    // `amount` is the product/top-up principal. `chargedAmount` includes any
+    // customer-paid gateway fee for platform Paystack collections.
     amount: { type: Number, required: true },
     chargedAmount: { type: Number },
     customerFee: { type: Number, default: 0 },

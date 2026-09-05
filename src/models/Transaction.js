@@ -7,7 +7,16 @@ const TransactionSchema = new Schema(
     agentId: { type: Schema.Types.ObjectId, ref: "Agent", index: true },
     type: {
       type: String,
-      enum: ["purchase", "funding", "payout", "commission", "topup", "fee", "refund"],
+      enum: [
+        "purchase",
+        "funding",
+        "payout",
+        "commission",
+        "commission_transfer",
+        "topup",
+        "fee",
+        "refund",
+      ],
       required: true,
     },
     description: { type: String, default: "" },

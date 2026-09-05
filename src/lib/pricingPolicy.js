@@ -5,17 +5,15 @@ export function canSetSellingPrice(role, sellingPrice, platformPrice) {
   return role === "superadmin" || money(sellingPrice) >= money(platformPrice);
 }
 
-/** Superadmins buy at provider cost; agents keep their configured retail price. */
+/** Superadmins buy at provider cost; agents spend the platform catalog price. */
 export function walletPurchasePrice({ role, providerCost, agentPrice, platformPrice }) {
   if (role === "superadmin") return money(providerCost);
-  return money(agentPrice ?? platformPrice);
+  return money(platformPrice);
 }
 
-/** Agent markup earned when the Buy Data portal uses a configured selling price. */
-export function agentBundleMargin({ role, agentPrice, platformPrice }) {
-  if (role === "superadmin") return 0;
-  const sellingPrice = money(agentPrice ?? platformPrice);
-  return money(Math.max(0, sellingPrice - money(platformPrice)));
+/** Portal wallet purchases do not earn storefront commission. */
+export function agentBundleMargin() {
+  return 0;
 }
 
 /** Complete wallet accounting for an agent-portal data purchase. */
@@ -25,8 +23,7 @@ export function walletPurchaseEconomics(options) {
   return {
     amount,
     agentMargin,
-    // On provider failure, return the net amount charged after margin credit.
-    refundAmount: money(amount - agentMargin),
+    refundAmount: amount,
   };
 }
 

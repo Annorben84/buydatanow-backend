@@ -16,16 +16,11 @@ import { crud } from "./lib/crud.js";
 import { crudScoped } from "./lib/crudScoped.js";
 import { requireAuth } from "./lib/auth.js";
 import { recordLog } from "./lib/audit.js";
-import { paystack, paystackConfigured, paystackMode, clientOrigin } from "./lib/paystackApi.js";
+import { paystack, paystackConfigured, clientOrigin } from "./lib/paystackApi.js";
 import { fulfilOrder, reverseOrder, syncNetpluseOrder } from "./lib/fulfilment.js";
 import { validPhone, normalizePhone } from "./lib/netpluseApi.js";
 import { canSetSellingPrice } from "./lib/pricingPolicy.js";
 import { getSettings, publicSettings } from "./lib/settings.js";
-import {
-  PaystackSubaccountError,
-  provisionPaystackSubaccount,
-  validMomoProvider,
-} from "./lib/paystackSubaccount.js";
 
 const router = Router();
 
@@ -75,13 +70,11 @@ router.get("/stores/slug/:slug", async (req, res, next) => {
         phone: doc.phone || "",
         whatsapp: doc.whatsapp || "",
         status: doc.status,
-        paymentMethod: doc.paymentMethod || "momo",
-        paymentProvider: doc.paymentProvider || "Mobile Money",
-        paymentAccountName:
-          doc.paymentMethod === "bank_transfer" ? doc.paymentAccountName || doc.name : "",
-        paymentAccount:
-          doc.paymentMethod === "bank_transfer" ? doc.paymentAccount || doc.phone || "" : "",
-        paymentInstructions: doc.paymentInstructions || "",
+        paymentMethod: "momo",
+        paymentProvider: "Paystack",
+        paymentAccountName: "",
+        paymentAccount: "",
+        paymentInstructions: "Payments are securely collected by the platform through Paystack.",
       },
     });
   } catch (err) {
@@ -104,9 +97,13 @@ router.get("/bundles/:id", bundle.get);
 router.post("/reports", async (req, res, next) => {
   try {
     const name = String(req.body.name || "").trim();
+    const phone = String(req.body.phone || "").trim();
     const category = String(req.body.category || "").trim();
     const description = String(req.body.description || "").trim();
     if (name.length < 2) return res.status(400).json({ error: "Please enter your name." });
+    if (!validPhone(phone)) {
+      return res.status(400).json({ error: "Enter a valid Ghana phone number." });
+    }
     if (!category) return res.status(400).json({ error: "Choose an issue type." });
     if (description.length < 10) {
       return res.status(400).json({ error: "Tell us what happened (at least 10 characters)." });
@@ -116,7 +113,8 @@ router.post("/reports", async (req, res, next) => {
     const report = await Report.create({
       reference,
       name,
-      phone: String(req.body.phone || "").trim(),
+      phone,
+      phoneNormalized: normalizePhone(phone),
       email: String(req.body.email || "").trim(),
       orderRef: String(req.body.orderRef || "").trim(),
       category,
@@ -126,6 +124,55 @@ router.post("/reports", async (req, res, next) => {
 
     recordLog("info", `New support ticket · ${category} · ${reference}`, "support");
     res.status(201).json({ data: { reference: report.reference } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Public report tracking by the payment phone number. Only the fields needed
+ * by the tracker are returned; contact details and the report description are
+ * deliberately excluded.
+ */
+router.get("/reports", async (req, res, next) => {
+  try {
+    const phone = normalizePhone(req.query.phone || "");
+    if (!validPhone(phone)) {
+      return res.status(400).json({ error: "Enter a valid Ghana phone number." });
+    }
+
+    // New reports use `phoneNormalized`. The regex fallbacks keep older
+    // reports searchable when their phone was saved with spaces or +233.
+    const loosePhonePattern = (digits) =>
+      new RegExp(`^\\D*${[...digits].join("\\D*")}\\D*$`);
+    const internationalPhone = `233${phone.slice(1)}`;
+    const docs = await Report.find({
+      $or: [
+        { phoneNormalized: phone },
+        { phone: loosePhonePattern(phone) },
+        { phone: loosePhonePattern(internationalPhone) },
+      ],
+    })
+      .select("reference category status createdAt updatedAt")
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+
+    const customerStatus = (status) => {
+      if (status === "Resolved") return "Resolved";
+      if (status === "Pending") return "Investigating";
+      return "Submitted";
+    };
+
+    res.json({
+      data: docs.map((report) => ({
+        reference: report.reference,
+        category: report.category,
+        status: customerStatus(report.status),
+        createdAt: report.createdAt,
+        updatedAt: report.updatedAt,
+      })),
+    });
   } catch (err) {
     next(err);
   }
@@ -536,12 +583,6 @@ const storeFields = [
   "phone",
   "whatsapp",
   "status",
-  "paymentMethod",
-  "paymentProvider",
-  "paymentAccountName",
-  "paymentAccount",
-  "paymentInstructions",
-  "momoProvider",
 ];
 
 function editableStore(body, { creating = false } = {}) {
@@ -552,19 +593,13 @@ function editableStore(body, { creating = false } = {}) {
   if (patch.slug) {
     patch.slug = patch.slug.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   }
-  if (patch.paymentMethod && !["momo", "bank_transfer"].includes(patch.paymentMethod)) {
-    throw Object.assign(new Error("Choose Mobile Money or bank transfer."), { status: 400 });
-  }
   if (patch.status && !["active", "paused"].includes(patch.status)) {
     throw Object.assign(new Error("Invalid store status."), { status: 400 });
   }
   if (creating) {
     patch.status = "active";
-    patch.paymentMethod ||= "momo";
-    patch.paymentProvider ||= "Mobile Money";
-    patch.momoProvider ||= "mtn";
-    patch.paymentAccountName ||= patch.name || "";
-    patch.paymentAccount ||= patch.phone || "";
+    patch.paymentMethod = "momo";
+    patch.paymentProvider = "Paystack";
   }
   return patch;
 }
@@ -575,11 +610,6 @@ function validateStore(patch, current = {}) {
   if (String(merged.slug || "").length < 2) return "Enter a valid store link.";
   if (String(merged.phone || "").replace(/\D/g, "").length < 9) return "Enter a valid phone number.";
   if (String(merged.whatsapp || "").replace(/\D/g, "").length < 9) return "Enter a valid WhatsApp number.";
-  if (String(merged.paymentAccount || "").length < 5) return "Configure where customers should pay you.";
-  if (String(merged.paymentAccountName || "").length < 2) return "Enter the payment account name.";
-  if (merged.paymentMethod === "momo" && !validMomoProvider(merged.momoProvider)) {
-    return "Choose MTN, AT Money, or Telecel Mobile Money.";
-  }
   return "";
 }
 
@@ -592,22 +622,9 @@ router.post("/stores", async (req, res, next) => {
     if (await Store.exists({ slug: payload.slug })) {
       return res.status(409).json({ error: "That store link is already taken." });
     }
-    if (payload.paymentMethod === "momo") {
-      const subaccount = await provisionPaystackSubaccount({
-        businessName: payload.name,
-        momoProvider: payload.momoProvider,
-        momoName: payload.paymentAccountName,
-        momoNumber: payload.paymentAccount,
-        contactEmail: req.agent.email,
-      });
-      Object.assign(payload, subaccount);
-    }
     const doc = await Store.create({ ...payload, agent: req.agent._id });
     res.status(201).json({ data: doc });
   } catch (err) {
-    if (err instanceof PaystackSubaccountError) {
-      return res.status(err.status).json({ error: err.message });
-    }
     next(err);
   }
 });
@@ -619,29 +636,8 @@ router.patch("/stores/:id", async (req, res, next) => {
     const patch = editableStore(req.body);
     const error = validateStore(patch, current);
     if (error) return res.status(400).json({ error });
-    const merged = { ...current, ...patch };
-    const momoDetailsChanged = ["name", "momoProvider", "paymentAccountName", "paymentAccount"]
-      .some((field) => String(merged[field] || "") !== String(current[field] || ""));
-    if (
-      merged.paymentMethod === "momo" &&
-      (momoDetailsChanged ||
-        !/^ACCT_[A-Za-z0-9]+$/.test(String(current.paystackSubaccountCode || "")) ||
-        !current.paystackSubaccountActive ||
-        (current.paystackSubaccountMode && current.paystackSubaccountMode !== paystackMode()))
-    ) {
-      const subaccount = await provisionPaystackSubaccount({
-        existingCode:
-          current.paystackSubaccountMode && current.paystackSubaccountMode !== paystackMode()
-            ? ""
-            : current.paystackSubaccountCode,
-        businessName: merged.name,
-        momoProvider: merged.momoProvider,
-        momoName: merged.paymentAccountName,
-        momoNumber: merged.paymentAccount,
-        contactEmail: req.agent.email,
-      });
-      Object.assign(patch, subaccount);
-    }
+    patch.paymentMethod = "momo";
+    patch.paymentProvider = "Paystack";
     const doc = await Store.findOneAndUpdate(
       { _id: current._id, agent: req.agent._id },
       { $set: patch },
@@ -649,9 +645,6 @@ router.patch("/stores/:id", async (req, res, next) => {
     );
     res.json({ data: doc });
   } catch (err) {
-    if (err instanceof PaystackSubaccountError) {
-      return res.status(err.status).json({ error: err.message });
-    }
     next(err);
   }
 });
@@ -801,11 +794,6 @@ router.get("/earnings", async (req, res, next) => {
     const monthStart = new Date(startToday.getFullYear(), startToday.getMonth(), 1);
     const thirtyDayStart = new Date(startToday.getTime() - 29 * dayMs);
     const done = { agent: agentId, status: "completed" };
-    const commissionEligible = {
-      agent: agentId,
-      status: { $in: ["pending", "processing", "completed"] },
-    };
-
     const periodAggregate = (from, to) => {
       const createdAt = to ? { $gte: from, $lt: to } : { $gte: from };
       return Order.aggregate([
@@ -815,7 +803,6 @@ router.get("/earnings", async (req, res, next) => {
     };
 
     const [
-      availableCommissionAgg,
       totalsAgg,
       todayAgg,
       sevenDayAgg,
@@ -825,10 +812,6 @@ router.get("/earnings", async (req, res, next) => {
       storeAgg,
       recent,
     ] = await Promise.all([
-      Order.aggregate([
-        { $match: commissionEligible },
-        { $group: { _id: null, earnings: { $sum: "$earning" } } },
-      ]),
       Order.aggregate([
         { $match: done },
         { $group: { _id: null, earnings: { $sum: "$earning" }, orders: { $sum: 1 } } },
@@ -875,15 +858,19 @@ router.get("/earnings", async (req, res, next) => {
       });
     }
 
-    const availableCommission = availableCommissionAgg[0]?.earnings || 0;
     const totals = totalsAgg[0] || { earnings: 0, orders: 0 };
     const today = todayAgg[0] || { earnings: 0, orders: 0 };
     const sevenDays = sevenDayAgg[0] || { earnings: 0, orders: 0 };
     const previousSevenDays = previousSevenDayAgg[0] || { earnings: 0, orders: 0 };
     const month = monthAgg[0] || { earnings: 0, orders: 0 };
+    const availableCommission = money(req.agent.commissionAvailable || 0);
+    const transferableCommission = availableCommission;
+    const heldCommission = money(req.agent.commissionHeld || 0);
     res.json({
       data: {
-        availableCommission: money(availableCommission),
+        availableCommission,
+        transferableCommission,
+        heldCommission,
         totalEarnings: money(totals.earnings),
         completedOrders: totals.orders,
         avgEarning: totals.orders > 0 ? money(totals.earnings / totals.orders) : 0,

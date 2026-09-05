@@ -86,7 +86,7 @@ test("calculates the superadmin margin on an agent portal purchase", () => {
   assert.equal(platformBundleMargin({ platformPrice: 4.2, providerCost: 4.4 }), 0);
 });
 
-test("credits only configured agent markup as Buy Data commission", () => {
+test("keeps agent-portal purchases separate from storefront commission", () => {
   assert.equal(
     agentBundleMargin({ role: "agent", platformPrice: 4.7 }),
     0,
@@ -94,13 +94,13 @@ test("credits only configured agent markup as Buy Data commission", () => {
   );
   assert.equal(
     agentBundleMargin({ role: "agent", agentPrice: 5.1, platformPrice: 4.7 }),
-    0.4,
-    "the configured markup becomes agent commission"
+    0,
+    "a storefront selling price does not create commission on a portal purchase"
   );
   assert.equal(
     agentBundleMargin({ role: "agent", agentPrice: 11, platformPrice: 8.65 }),
-    2.35,
-    "a 2 GB price raised from GHS 8.65 to GHS 11.00 earns GHS 2.35 commission"
+    0,
+    "portal purchases never create withdrawable commission"
   );
   assert.equal(
     agentBundleMargin({ role: "superadmin", agentPrice: 5.1, platformPrice: 4.7 }),
@@ -109,14 +109,14 @@ test("credits only configured agent markup as Buy Data commission", () => {
   );
 });
 
-test("keeps Buy Data commission and failure refunds balanced", () => {
+test("charges and refunds the platform price for agent Buy Data purchases", () => {
   assert.deepEqual(
     walletPurchaseEconomics({ role: "agent", platformPrice: 4.7 }),
     { amount: 4.7, agentMargin: 0, refundAmount: 4.7 }
   );
   assert.deepEqual(
     walletPurchaseEconomics({ role: "agent", agentPrice: 5.1, platformPrice: 4.7 }),
-    { amount: 5.1, agentMargin: 0.4, refundAmount: 4.7 }
+    { amount: 4.7, agentMargin: 0, refundAmount: 4.7 }
   );
   assert.deepEqual(
     walletPurchaseEconomics({ role: "superadmin", providerCost: 4.4 }),

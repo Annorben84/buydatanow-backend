@@ -10,6 +10,10 @@ const AgentSchema = new Schema(
     // Never returned by default (must be explicitly `.select("+passwordHash")`).
     passwordHash: { type: String, select: false },
     wallet: { type: Number, default: 0 },
+    // Storefront commission becomes available only after confirmed delivery.
+    // Agents may either move it to their wallet or place it on hold for payout.
+    commissionAvailable: { type: Number, default: 0, min: 0 },
+    commissionHeld: { type: Number, default: 0, min: 0 },
     revenue: { type: Number, default: 0 },
     tier: { type: String, enum: ["Bronze", "Silver", "Gold"], default: "Bronze" },
     status: { type: String, enum: ["active", "suspended"], default: "active" },

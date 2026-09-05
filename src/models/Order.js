@@ -37,6 +37,12 @@ const OrderSchema = new Schema(
     // agent purchases leave these blank.
     paymentProvider: { type: String, default: "" },
     paymentReference: { type: String, index: true, sparse: true },
+    settlementModel: {
+      type: String,
+      enum: ["platform_collected", "agent_wallet_debit"],
+    },
+    // Idempotency claim for commission/platform-margin settlement after delivery.
+    earningsSettledAt: { type: Date },
     refund: {
       status: { type: String, default: "" },
       providerRef: { type: String, default: "" },

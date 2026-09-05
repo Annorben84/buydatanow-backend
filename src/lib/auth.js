@@ -34,6 +34,8 @@ export function publicAgent(doc) {
     email: a.email,
     phone: a.phone,
     wallet: a.wallet,
+    commissionAvailable: a.commissionAvailable || 0,
+    commissionHeld: a.commissionHeld || 0,
     revenue: a.revenue,
     tier: a.tier,
     status: a.status,

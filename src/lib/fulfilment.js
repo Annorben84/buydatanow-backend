@@ -10,6 +10,7 @@ import { Agent, Customer, Order, Payment, Store, Transaction } from "../models/i
 import { recordLog } from "./audit.js";
 import { withMongoTransaction } from "./mongoTransaction.js";
 import { requestPaystackRefundForOrder } from "./paystackRefund.js";
+import { platformCollectedEarnings } from "./platformEarnings.js";
 import {
   netpluseBuyData,
   netpluseConfigured,
@@ -20,6 +21,122 @@ import {
 } from "./netpluseApi.js";
 
 const money = (n) => Math.round(Number(n) * 100) / 100;
+
+/**
+ * Release platform-collected storefront earnings only after confirmed delivery.
+ * The order claim makes this safe across callbacks, polling, and retries.
+ */
+export async function settleCompletedOrderEarnings(inputOrder) {
+  if (
+    inputOrder.status !== "completed" ||
+    inputOrder.settlementModel !== "platform_collected" ||
+    inputOrder.earningsSettledAt
+  ) {
+    return false;
+  }
+
+  return withMongoTransaction(async (session) => {
+    const order = await Order.findOneAndUpdate(
+      {
+        _id: inputOrder._id,
+        status: "completed",
+        settlementModel: "platform_collected",
+        earningsSettledAt: null,
+      },
+      { $set: { earningsSettledAt: new Date() } },
+      { new: true, session }
+    );
+    if (!order) return false;
+
+    const agent = await Agent.findById(order.agent).session(session);
+    if (!agent) throw new Error(`Cannot settle earnings for ${order.ref}: agent not found.`);
+
+    const rows = [];
+    const payment = order.paymentReference
+      ? await Payment.findOne({ reference: order.paymentReference }).session(session)
+      : null;
+    const earnings = platformCollectedEarnings({
+      agentMargin: order.earning,
+      platformMargin: order.platformEarning,
+      chargedAmount: payment?.chargedAmount,
+      principal: payment?.amount,
+      gatewayFee: payment?.gatewayFee,
+    });
+    const agentMargin = earnings.agentCommission;
+    if (agentMargin > 0) {
+      await Agent.updateOne(
+        { _id: agent._id },
+        { $inc: { commissionAvailable: agentMargin } },
+        { session }
+      );
+      rows.push({
+        agentId: agent._id,
+        agent: agent.name,
+        store: order.store,
+        type: "commission",
+        description: `Storefront commission earned · ${order.carrier} ${order.gb}GB`,
+        amount: agentMargin,
+        reference: `${order.ref}-margin`,
+      });
+    }
+
+    const {
+      feeRecovery,
+      gatewayFee,
+      platformMargin,
+      platformNet,
+    } = earnings;
+    const superadmin = await Agent.findOne({ role: "superadmin" })
+      .sort({ createdAt: 1 })
+      .session(session);
+
+    if (superadmin) {
+      if (platformNet !== 0) {
+        await Agent.updateOne(
+          { _id: superadmin._id },
+          { $inc: { wallet: platformNet } },
+          { session }
+        );
+      }
+      if (platformMargin !== 0) {
+        rows.push({
+          agentId: superadmin._id,
+          agent: superadmin.name,
+          store: order.store,
+          type: platformMargin > 0 ? "commission" : "fee",
+          description: `${platformMargin > 0 ? "Platform margin" : "Platform price subsidy"} · ${order.store} · ${order.carrier} ${order.gb}GB`,
+          amount: platformMargin,
+          reference: `${order.ref}-${platformMargin > 0 ? "platform" : "platform-subsidy"}`,
+        });
+      }
+      if (feeRecovery > 0) {
+        rows.push({
+          agentId: superadmin._id,
+          agent: superadmin.name,
+          store: order.store,
+          type: "fee",
+          description: `Paystack fee paid by customer · ${order.store}`,
+          amount: feeRecovery,
+          reference: `${order.ref}-paystack-fee-recovery`,
+        });
+      }
+      if (gatewayFee > 0) {
+        rows.push({
+          agentId: superadmin._id,
+          agent: superadmin.name,
+          store: order.store,
+          type: "fee",
+          description: `Paystack fee · ${order.store}`,
+          amount: -gatewayFee,
+          reference: `${order.ref}-paystack-fee`,
+        });
+      }
+    }
+
+    if (rows.length) await Transaction.create(rows, { session, ordered: true });
+    return true;
+  });
+}
 
 /** Claim and deliver a saved order. Safe when called by multiple recovery paths. */
 export async function fulfilOrder(inputOrder, reversal) {
@@ -72,6 +189,7 @@ export async function fulfilOrder(inputOrder, reversal) {
     order.status = "completed";
     order.deliveredAt = new Date();
     await order.save();
+    await settleCompletedOrderEarnings(order);
     await markPaymentFulfilled(order);
     return { status: order.status, simulated: true };
   }
@@ -115,7 +233,10 @@ export async function fulfilOrder(inputOrder, reversal) {
   if (result.status === "completed") order.deliveredAt = new Date();
   await order.save();
 
-  if (result.status === "completed") await markPaymentFulfilled(order);
+  if (result.status === "completed") {
+    await settleCompletedOrderEarnings(order);
+    await markPaymentFulfilled(order);
+  }
   if (["completed", "processing"].includes(result.status)) {
     recordLog(
       "info",
@@ -375,6 +496,7 @@ export async function syncNetpluseOrder(inputOrder) {
     order.status = "completed";
     order.deliveredAt = order.deliveredAt || new Date();
     await order.save();
+    await settleCompletedOrderEarnings(order);
     await markPaymentFulfilled(order);
     return {
       checked: true,
@@ -406,6 +528,15 @@ export async function syncPendingOrders({ limit = 50 } = {}) {
   const undispatched = await Order.find({ status: "pending" }).sort({ createdAt: 1 }).limit(limit);
   for (const order of undispatched) await fulfilOrder(order);
 
+  const unsettledEarnings = await Order.find({
+    status: "completed",
+    settlementModel: "platform_collected",
+    earningsSettledAt: null,
+  })
+    .sort({ createdAt: 1 })
+    .limit(limit);
+  for (const order of unsettledEarnings) await settleCompletedOrderEarnings(order);
+
   // A database outage during reversal must not leave a charged failed or
   // cancelled order stranded forever. Retry only the atomic internal reversal;
   // the refund helper has its own one-time claim.
@@ -421,8 +552,8 @@ export async function syncPendingOrders({ limit = 50 } = {}) {
 
   if (!netpluseLive()) {
     return {
-      checked: undispatched.length + unreversed.length,
-      delivered: 0,
+      checked: undispatched.length + unreversed.length + unsettledEarnings.length,
+      delivered: unsettledEarnings.length,
       failed: unreversedFailures,
     };
   }
@@ -441,7 +572,7 @@ export async function syncPendingOrders({ limit = 50 } = {}) {
   }
 
   return {
-    checked: pending.length + undispatched.length + unreversed.length,
+    checked: pending.length + undispatched.length + unreversed.length + unsettledEarnings.length,
     delivered,
     failed: failed + unreversedFailures,
   };

@@ -50,14 +50,16 @@ API runs on `http://localhost:5000`. Check `http://localhost:5000/api/health`.
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/api/health` | Status + DB connection state |
-| GET/POST | `/api/stores` | List / create stores; MoMo creation provisions a Paystack subaccount |
+| GET/POST | `/api/stores` | List / create stores; checkout uses the platform Paystack account |
 | GET | `/api/stores/slug/:slug` | Public storefront lookup |
-| POST | `/api/stores/slug/:slug/pay/init` | Provider preflight + hosted Paystack MoMo checkout or manual bank-payment request |
-| POST | `/api/stores/slug/:slug/pay/submit` | Customer submits a manual bank transaction ID |
+| POST | `/api/stores/slug/:slug/pay/init` | Provider preflight + hosted platform Paystack MoMo checkout |
+| POST | `/api/stores/slug/:slug/pay/submit` | Legacy manual-payment claims only |
 | GET | `/api/stores/slug/:slug/pay/status/:reference` | Customer-safe payment/order status |
-| POST | `/api/payments/:reference/confirm` | Store owner confirms receipt, debits wallet, fulfils order |
-| POST | `/api/payments/:reference/reject` | Store owner rejects an unmatched payment claim |
+| POST | `/api/payments/:reference/confirm` | Resolve a legacy manual-payment claim |
+| POST | `/api/payments/:reference/reject` | Reject a legacy manual-payment claim |
 | POST | `/api/wallet/paystack/init` and `/verify` | Verified agent wallet top-up |
+| POST | `/api/wallet/commission-transfer` | Move available commission into the spendable wallet |
+| POST | `/api/wallet/withdraw` | Hold available commission for owner-paid payout |
 | POST | `/api/paystack/webhook` | Signed Paystack event receiver |
 | GET/PATCH/DELETE | `/api/stores/:id` | Read / update / delete a store |
 | GET/POST/PATCH/DELETE | `/api/bundles` | Data bundles (Pricing / Buy Data) |
@@ -74,28 +76,24 @@ All responses are `{ "data": ... }`. Errors are `{ "error": "..." }`.
 ## Storefront payment model
 
 Paystack is used for agent wallet top-ups and hosted storefront Mobile Money
-checkout. When an agent configures a MoMo store, they provide the provider,
-registered name, and number. The backend fetches Paystack's current Ghana MoMo
-settlement institutions and creates (or later updates) a zero-platform-share
-Paystack subaccount. The `ACCT_...` code and Paystack-resolved settlement state
-are stored privately; agents never enter a subaccount code themselves.
+checkout. Both payment types settle into the platform Paystack account. Stores
+do not create or use Paystack subaccounts.
 
 1. A customer selects a bundle and enters only the phone number that should
    receive the data. A receipt email is optional.
 2. The customer is redirected to Paystack's hosted checkout, where Paystack
    collects their Mobile Money provider and payment number. Paystack routes the
-   collection to the store's subaccount and sends the trusted phone prompt. The
+   collection to the platform account and sends the trusted phone prompt. The
    storefront never asks for or stores the customer's MoMo PIN.
 3. A signed `charge.success` webhook (with status polling as fallback) verifies
    the payment.
-4. Verification atomically debits the platform/wholesale price from the agent's
-   prepaid wallet, records the sale, and dispatches the bundle to Netpluse.
-5. If delivery fails, the exact wallet debit and platform commission are reversed
-   and the Paystack refund workflow is started.
-
-Bank-transfer stores retain the manual fallback: the customer receives the bank
-instructions, submits the provider transaction ID, and the authenticated store
-owner confirms receipt before the same wallet-debit and fulfilment transaction.
+4. Verification records the paid sale without debiting the agent wallet and
+   dispatches the bundle to Netpluse.
+5. Confirmed delivery releases the agent margin to `commissionAvailable` and
+   books the platform margin. A delivery failure starts a full Paystack refund.
+6. Agents can move available commission to their wallet or request a payout.
+   Payout requests move commission to `commissionHeld`; the platform owner pays
+   externally and records the payout reference when approving.
 
 The agent's selling-price margin is **not** credited to the platform wallet;
 the agent already received it as part of the customer's direct payment. Payment

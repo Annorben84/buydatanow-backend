@@ -17,6 +17,7 @@ import { requireAdmin, hashPassword } from "./lib/auth.js";
 import { invalidateMaintenanceModeCache } from "./middleware/maintenanceMode.js";
 import { recordLog } from "./lib/audit.js";
 import { getSettings } from "./lib/settings.js";
+import { withMongoTransaction } from "./lib/mongoTransaction.js";
 import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import {
@@ -43,6 +44,8 @@ const agentRow = (a, stores = 0) => ({
   email: a.email,
   phone: a.phone,
   wallet: a.wallet,
+  commissionAvailable: a.commissionAvailable || 0,
+  commissionHeld: a.commissionHeld || 0,
   revenue: a.revenue,
   tier: a.tier,
   status: a.status,
@@ -63,41 +66,47 @@ router.get("/withdrawals", async (req, res, next) => {
   }
 });
 
-/** Load a still-pending withdrawal or respond with the right error. */
-async function loadPending(req, res) {
-  const w = await Withdrawal.findById(req.params.id);
-  if (!w) {
-    res.status(404).json({ error: "Withdrawal not found" });
-    return null;
-  }
-  if (w.status !== "pending") {
-    res.status(409).json({ error: `Already ${w.status}.` });
-    return null;
-  }
-  return w;
-}
-
 /**
- * POST /api/admin/withdrawals/:id/approve — pay it out. The funds were held
- * at request time, so this just finalizes: mark approved + log the payout on
- * the agent's ledger.
+ * Record a payout only after the platform owner has sent the money externally.
  */
 router.post("/withdrawals/:id/approve", async (req, res, next) => {
   try {
-    const w = await loadPending(req, res);
-    if (!w) return;
+    const payoutReference = String(req.body.reference || "").trim().slice(0, 120);
+    if (payoutReference.length < 4) {
+      return res.status(400).json({ error: "Enter the MoMo transaction ID or payout reference." });
+    }
 
-    w.status = "approved";
-    w.decidedAt = new Date();
-    await w.save();
+    const w = await withMongoTransaction(async (session) => {
+      const withdrawal = await Withdrawal.findOneAndUpdate(
+        { _id: req.params.id, status: "pending" },
+        { $set: { status: "approved", decidedAt: new Date(), payoutReference } },
+        { new: true, session }
+      );
+      if (!withdrawal) return null;
 
-    await Transaction.create({
-      agentId: w.agent,
-      agent: w.agentName,
-      type: "payout",
-      description: `Withdrawal · ${w.method}${w.destination ? ` · ${w.destination}` : ""}`,
-      amount: -w.amount,
+      const agent = await Agent.findOneAndUpdate(
+        { _id: withdrawal.agent, commissionHeld: { $gte: withdrawal.amount } },
+        { $inc: { commissionHeld: -withdrawal.amount } },
+        { new: true, session }
+      );
+      if (!agent) {
+        throw Object.assign(new Error("The agent's held commission does not cover this payout."), {
+          status: 409,
+        });
+      }
+
+      await Transaction.create([{
+        agentId: withdrawal.agent,
+        agent: withdrawal.agentName,
+        type: "payout",
+        description: `Commission payout · ${withdrawal.method}${withdrawal.destination ? ` · ${withdrawal.destination}` : ""}`,
+        amount: -withdrawal.amount,
+        reference: payoutReference,
+      }], { session, ordered: true });
+      return withdrawal;
     });
+
+    if (!w) return res.status(409).json({ error: "Withdrawal not found or already decided." });
 
     recordLog("info", `Withdrawal approved · ${w.agentName} · ₵${w.amount}`, "admin/withdrawals");
     res.json({ data: w });
@@ -106,23 +115,32 @@ router.post("/withdrawals/:id/approve", async (req, res, next) => {
   }
 });
 
-/** POST /api/admin/withdrawals/:id/reject — decline and refund the held amount. */
+/** Decline a request and release the held commission. */
 router.post("/withdrawals/:id/reject", async (req, res, next) => {
   try {
-    const w = await loadPending(req, res);
-    if (!w) return;
+    const w = await withMongoTransaction(async (session) => {
+      const withdrawal = await Withdrawal.findOneAndUpdate(
+        { _id: req.params.id, status: "pending" },
+        { $set: { status: "rejected", decidedAt: new Date() } },
+        { new: true, session }
+      );
+      if (!withdrawal) return null;
+      const agent = await Agent.findOneAndUpdate(
+        { _id: withdrawal.agent, commissionHeld: { $gte: withdrawal.amount } },
+        { $inc: { commissionHeld: -withdrawal.amount, commissionAvailable: withdrawal.amount } },
+        { new: true, session }
+      );
+      if (!agent) {
+        throw Object.assign(new Error("The agent's held commission does not cover this request."), {
+          status: 409,
+        });
+      }
+      return withdrawal;
+    });
 
-    const agent = await Agent.findById(w.agent);
-    if (agent) {
-      agent.wallet = money(agent.wallet + w.amount);
-      await agent.save();
-    }
+    if (!w) return res.status(409).json({ error: "Withdrawal not found or already decided." });
 
-    w.status = "rejected";
-    w.decidedAt = new Date();
-    await w.save();
-
-    recordLog("info", `Withdrawal rejected · ${w.agentName} · ₵${w.amount} refunded`, "admin/withdrawals");
+    recordLog("info", `Withdrawal rejected · ${w.agentName} · ₵${w.amount} released`, "admin/withdrawals");
     res.json({ data: w });
   } catch (err) {
     next(err);

@@ -25,7 +25,8 @@ function directStatus(payment) {
 /**
  * Book a verified storefront sale against the agent's prepaid wallet.
  * Customer money is outside the platform ledger: either the agent manually
- * confirmed it, or Paystack routed it to the agent's subaccount.
+ * confirmed it. Retained only for historical agent-direct payment claims;
+ * new storefront checkouts use platform collection.
  */
 export async function bookAgentWalletStorefrontOrder(claimed, session, options = {}) {
   const [store, owner] = await Promise.all([

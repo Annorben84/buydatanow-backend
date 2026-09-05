@@ -171,9 +171,10 @@ export async function settleVerifiedPayment(reference, gatewayData) {
       return { action: "mismatch", paymentId: claimed._id, mismatch: claimed.failureReason };
     }
 
-    const superadmin = await Agent.findOne({ role: "superadmin" })
-      .sort({ createdAt: 1 })
-      .session(session);
+    // Retained only for pre-migration payment intents with no settlement model.
+    const superadmin = claimed.settlementModel !== "platform_collected"
+      ? await Agent.findOne({ role: "superadmin" }).sort({ createdAt: 1 }).session(session)
+      : null;
 
     const [order] = await Order.create(
       [
@@ -192,13 +193,18 @@ export async function settleVerifiedPayment(reference, gatewayData) {
           status: "pending",
           paymentProvider: "paystack",
           paymentReference: claimed.reference,
+          settlementModel: claimed.settlementModel || undefined,
           reversal: {
             agent: agent._id,
             agentName: agent.name,
-            agentWalletAdjustment: money(-claimed.agentMargin),
-            platformWalletAdjustment: superadmin
-              ? money(-(claimed.platformMargin + feeRecovery - claimed.gatewayFee))
-              : 0,
+            agentWalletAdjustment:
+              claimed.settlementModel === "platform_collected"
+                ? 0
+                : money(-claimed.agentMargin),
+            platformWalletAdjustment:
+              claimed.settlementModel === "platform_collected" || !superadmin
+                ? 0
+                : money(-(claimed.platformMargin + feeRecovery - claimed.gatewayFee)),
             storeId: store._id,
           },
         },
@@ -217,7 +223,7 @@ export async function settleVerifiedPayment(reference, gatewayData) {
     );
     const newCustomer = Boolean(customerResult.upsertedCount);
 
-    if (claimed.agentMargin > 0) {
+    if (claimed.settlementModel !== "platform_collected" && claimed.agentMargin > 0) {
       await Agent.updateOne(
         { _id: agent._id },
         { $inc: { wallet: claimed.agentMargin } },

@@ -24,16 +24,6 @@ function validEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || "").trim());
 }
 
-function directPaymentDetails(store) {
-  return {
-    method: store.paymentMethod || "momo",
-    provider: store.paymentProvider || "Mobile Money",
-    accountName: store.paymentAccountName || store.name,
-    account: store.paymentAccount || store.phone,
-    instructions: store.paymentInstructions || "Use the order reference as the payment note.",
-  };
-}
-
 function publicPaymentStatus(payment) {
   const phone = String(payment.phone || "").replace(/\D/g, "");
   return {
@@ -57,13 +47,13 @@ function publicPaymentStatus(payment) {
 /** The unsafe legacy endpoint could spend an agent wallet without payment proof. */
 router.post("/stores/slug/:slug/buy", (_req, res) => {
   res.status(410).json({
-    error: "Direct purchases are disabled. Submit payment details for the store owner to confirm.",
+    error: "Direct purchases are disabled. Use the platform Paystack checkout.",
   });
 });
 
 /**
- * Create an immutable direct-payment request. No customer money reaches the
- * platform and no wallet is touched at this stage.
+ * Initialize a platform-collected Paystack checkout. The agent wallet is not
+ * involved in a storefront sale.
  */
 router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
   try {
@@ -118,12 +108,6 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
     if (!canSetSellingPrice(owner.role, amount, platformPrice)) {
       return res.status(409).json({ error: "This store's bundle price needs administrator review." });
     }
-    if (money(owner.wallet) < platformPrice) {
-      return res.status(409).json({
-        error: "This store is temporarily unable to fulfil this bundle. Please contact the store owner.",
-      });
-    }
-
     const { agentMargin, platformMargin } = storefrontMargins({
       role: owner.role,
       sellingPrice: amount,
@@ -132,136 +116,34 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
     });
     const reference = `DP-${randomUUID()}`;
 
-    if ((store.paymentMethod || "momo") === "momo") {
-      if (!paystackConfigured()) {
-        return res.status(503).json({ error: "Mobile Money checkout is temporarily unavailable." });
-      }
-      if (
-        !/^ACCT_[A-Za-z0-9]+$/.test(String(store.paystackSubaccountCode || "")) ||
-        !store.paystackSubaccountActive
-      ) {
-        return res.status(409).json({
-          error: "This store has not connected its Paystack payment account yet.",
-        });
-      }
+    if (!paystackConfigured()) {
+      return res.status(503).json({ error: "Mobile Money checkout is temporarily unavailable." });
+    }
 
-      const customerEmail = String(req.body.email || "").trim().toLowerCase();
-      const email = customerEmail || String(owner.email || "").trim().toLowerCase();
-      if (customerEmail && !validEmail(customerEmail)) {
-        return res.status(400).json({ error: "Enter a valid email or leave the receipt email blank." });
-      }
-      if (!validEmail(email)) {
-        return res.status(409).json({
-          error: "This store needs a valid owner email before Mobile Money payments can be started.",
-        });
-      }
-
-      const charge = customerPaystackCharge(amount);
-      const chargedAmount = money(charge.totalSubunit / 100);
-      const customerFee = money(charge.feeSubunit / 100);
-      const intent = await Payment.create({
-        reference,
-        provider: "paystack",
-        purpose: "storefront_order",
-        status: "initialized",
-        amount,
-        chargedAmount,
-        customerFee,
-        currency: "GHS",
-        email,
-        payerName,
-        agent: owner._id,
-        store: store._id,
-        storeSlug: slug,
-        network,
-        gb,
-        phone,
-        platformPrice,
-        providerCost,
-        agentMargin,
-        platformMargin,
-        paymentMethod: "momo",
-        paymentDestination: store.paystackSubaccountCode,
-        verificationMode: "gateway",
-        settlementModel: "agent_wallet_debit",
-      });
-
-      const returnUrl = `${clientOrigin().replace(/\/$/, "")}/store/${encodeURIComponent(
-        slug
-      )}?payment_reference=${encodeURIComponent(reference)}`;
-      const { ok, json } = await paystack("/transaction/initialize", {
-        method: "POST",
-        body: JSON.stringify({
-          email,
-          amount: charge.totalSubunit,
-          currency: "GHS",
-          reference,
-          channels: ["mobile_money"],
-          callback_url: returnUrl,
-          subaccount: store.paystackSubaccountCode,
-          transaction_charge: 0,
-          bearer: "subaccount",
-          metadata: {
-            agentId: String(owner._id),
-            purpose: "storefront_order",
-            storeSlug: slug,
-            network,
-            gb,
-            phone,
-          },
-        }),
-      });
-
-      if (!ok || !json?.status) {
-        const failureReason = String(
-          json?.data?.message || json?.message || "Could not open the secure Paystack checkout."
-        );
-        await Payment.updateOne(
-          { _id: intent._id },
-          {
-            $set: {
-              status: "failed",
-              failureReason,
-            },
-          }
-        );
-        return res.status(502).json({ error: failureReason });
-      }
-
-      await Payment.updateOne(
-        { _id: intent._id },
-        { $set: { gatewayStatus: "checkout_created" } }
-      );
-
-      return res.status(201).json({
-        data: {
-          mode: "paystack_redirect",
-          reference,
-          amount,
-          fee: customerFee,
-          chargedAmount,
-          feePercent: paystackFeePercent(),
-          currency: "GHS",
-          status: "checkout_created",
-          authorizationUrl: json.data.authorization_url,
-          accessCode: json.data.access_code,
-        },
+    const customerEmail = String(req.body.email || "").trim().toLowerCase();
+    const email = customerEmail || String(owner.email || "").trim().toLowerCase();
+    if (customerEmail && !validEmail(customerEmail)) {
+      return res.status(400).json({ error: "Enter a valid email or leave the receipt email blank." });
+    }
+    if (!validEmail(email)) {
+      return res.status(409).json({
+        error: "This store needs a valid owner email before Mobile Money payments can be started.",
       });
     }
 
-    const payment = directPaymentDetails(store);
-    if (!payment.account) {
-      return res.status(409).json({ error: "This store has not configured a customer payment account." });
-    }
-    await Payment.create({
+    const charge = customerPaystackCharge(amount);
+    const chargedAmount = money(charge.totalSubunit / 100);
+    const customerFee = money(charge.feeSubunit / 100);
+    const intent = await Payment.create({
       reference,
-      provider: "agent_direct",
+      provider: "paystack",
       purpose: "storefront_order",
-      status: "awaiting_payment",
+      status: "initialized",
       amount,
-      chargedAmount: amount,
-      customerFee: 0,
+      chargedAmount,
+      customerFee,
       currency: "GHS",
+      email,
       payerName,
       agent: owner._id,
       store: store._id,
@@ -273,20 +155,64 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
       providerCost,
       agentMargin,
       platformMargin,
-      paymentMethod: payment.method,
-      paymentDestination: payment.account,
-      verificationMode: "agent_confirmation",
-      settlementModel: "agent_wallet_debit",
+      paymentMethod: "momo",
+      paymentDestination: "platform",
+      verificationMode: "gateway",
+      settlementModel: "platform_collected",
     });
 
-    res.status(201).json({
+    const returnUrl = `${clientOrigin().replace(/\/$/, "")}/store/${encodeURIComponent(
+      slug
+    )}?payment_reference=${encodeURIComponent(reference)}`;
+    const { ok, json } = await paystack("/transaction/initialize", {
+      method: "POST",
+      body: JSON.stringify({
+        email,
+        amount: charge.totalSubunit,
+        currency: "GHS",
+        reference,
+        channels: ["mobile_money"],
+        callback_url: returnUrl,
+        metadata: {
+          agentId: String(owner._id),
+          purpose: "storefront_order",
+          settlementModel: "platform_collected",
+          storeSlug: slug,
+          network,
+          gb,
+          phone,
+        },
+      }),
+    });
+
+    if (!ok || !json?.status) {
+      const failureReason = String(
+        json?.data?.message || json?.message || "Could not open the secure Paystack checkout."
+      );
+      await Payment.updateOne(
+        { _id: intent._id },
+        { $set: { status: "failed", failureReason } }
+      );
+      return res.status(502).json({ error: failureReason });
+    }
+
+    await Payment.updateOne(
+      { _id: intent._id },
+      { $set: { gatewayStatus: "checkout_created" } }
+    );
+
+    return res.status(201).json({
       data: {
-        mode: "manual",
+        mode: "paystack_redirect",
         reference,
         amount,
+        fee: customerFee,
+        chargedAmount,
+        feePercent: paystackFeePercent(),
         currency: "GHS",
-        status: "awaiting_payment",
-        payment,
+        status: "checkout_created",
+        authorizationUrl: json.data.authorization_url,
+        accessCode: json.data.access_code,
       },
     });
   } catch (err) {
@@ -294,7 +220,7 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
   }
 });
 
-/** Customer supplies the provider transaction ID after paying the agent. */
+/** Legacy only: customer supplies a transaction ID for an older direct-payment intent. */
 router.post("/stores/slug/:slug/pay/submit", async (req, res, next) => {
   try {
     const reference = String(req.body.reference || "").trim();
