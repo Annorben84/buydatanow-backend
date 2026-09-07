@@ -130,15 +130,12 @@ router.post("/commission-transfer", async (req, res, next) => {
   }
 });
 
-/** Portal data purchases must be proven by Paystack before fulfilment. */
-router.post("/spend", (_req, res) => {
-  res.status(410).json({
-    error: "Wallet purchases are disabled. Continue through the secure Paystack checkout.",
-  });
-});
-
-/** Retained only as migration context for pre-Paystack wallet orders. */
-if (false) router.post("/spend", async (req, res, next) => {
+/**
+ * Buy data from the authenticated portal using Balance Left.
+ * The trusted catalog price is debited exactly and self-service purchases do
+ * not earn agent commission; commission belongs to delivered storefront sales.
+ */
+router.post("/spend", async (req, res, next) => {
   try {
     const network = String(req.body.network || "").trim();
     const gb = Number(req.body.gb) || 0;
@@ -148,7 +145,6 @@ if (false) router.post("/spend", async (req, res, next) => {
     }
 
     let amount;
-    let agentMargin = 0;
     let refundAmount;
     let platformMargin = 0;
     if (req.agent.role === "superadmin") {
@@ -159,14 +155,14 @@ if (false) router.post("/spend", async (req, res, next) => {
       if (!providerBundle) {
         return res.status(400).json({ error: "That bundle is not listed by Netpluse." });
       }
-      ({ amount, agentMargin, refundAmount } = walletPurchaseEconomics({
+      ({ amount, refundAmount } = walletPurchaseEconomics({
         role: req.agent.role,
         providerCost: providerBundle.cost,
       }));
     } else {
       const bundle = await Bundle.findOne({ carrier: network, gb, active: true }).lean();
       if (!bundle) return res.status(400).json({ error: "That bundle isn't available." });
-      ({ amount, agentMargin, refundAmount } = walletPurchaseEconomics({
+      ({ amount, refundAmount } = walletPurchaseEconomics({
         role: req.agent.role,
         platformPrice: bundle.price,
       }));
@@ -198,14 +194,6 @@ if (false) router.post("/spend", async (req, res, next) => {
         );
       }
 
-      if (agentMargin > 0) {
-        await Agent.updateOne(
-          { _id: agent._id },
-          { $inc: { wallet: agentMargin } },
-          { session }
-        );
-      }
-
       const ledgerEntries = [
         {
           agentId: agent._id,
@@ -216,16 +204,6 @@ if (false) router.post("/spend", async (req, res, next) => {
           reference: `${ref}-purchase`,
         },
       ];
-      if (agentMargin > 0) {
-        ledgerEntries.push({
-          agentId: agent._id,
-          agent: agent.name,
-          type: "commission",
-          description: `Sale margin · agent purchase · ${network} ${gb}GB`,
-          amount: agentMargin,
-          reference: `${ref}-margin`,
-        });
-      }
       const [transaction] = await Transaction.create(
         ledgerEntries,
         { session, ordered: true }
@@ -241,14 +219,15 @@ if (false) router.post("/spend", async (req, res, next) => {
             bundle: `${gb} GB`,
             gb,
             amount,
-            earning: agentMargin,
+            earning: 0,
             platformEarning: creditedPlatformMargin,
             status: "pending",
+            paymentProvider: "wallet",
+            settlementModel: "agent_wallet_debit",
             reversal: {
               agent: agent._id,
               agentName: agent.name,
-              // The margin was credited above, so a failed order returns only
-              // the net platform cost. Purchase + commission + refund then sum to zero.
+              // A failed portal order returns the exact amount that was debited.
               agentWalletAdjustment: refundAmount,
               platformWalletAdjustment: superadmin ? -creditedPlatformMargin : 0,
             },

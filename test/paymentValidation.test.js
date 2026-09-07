@@ -9,6 +9,7 @@ import {
   portalPurchaseEconomics,
   portalPurchasePrice,
   storefrontMargins,
+  walletPurchaseEconomics,
 } from "../src/lib/pricingPolicy.js";
 import {
   capacityInGb,
@@ -84,7 +85,7 @@ test("calculates the superadmin margin on an agent portal purchase", () => {
   assert.equal(platformBundleMargin({ platformPrice: 4.2, providerCost: 4.4 }), 0);
 });
 
-test("prices Paystack portal purchases without creating agent commission", () => {
+test("prices portal purchases without creating agent commission", () => {
   assert.deepEqual(
     portalPurchaseEconomics({ role: "agent", platformPrice: 4.7, providerCost: 4.4 }),
     { amount: 4.7, agentMargin: 0, platformMargin: 0.3 }
@@ -92,6 +93,10 @@ test("prices Paystack portal purchases without creating agent commission", () =>
   assert.deepEqual(
     portalPurchaseEconomics({ role: "superadmin", providerCost: 4.4, platformPrice: 4.7 }),
     { amount: 4.4, agentMargin: 0, platformMargin: 0 }
+  );
+  assert.deepEqual(
+    walletPurchaseEconomics({ role: "agent", platformPrice: 4.7, providerCost: 4.4 }),
+    { amount: 4.7, agentMargin: 0, refundAmount: 4.7 }
   );
 });
 

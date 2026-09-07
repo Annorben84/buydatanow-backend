@@ -1,4 +1,4 @@
-import { Agent, Customer, Order, Payment, Store, Transaction } from "../models/index.js";
+import { Agent, Order, Payment } from "../models/index.js";
 import { publicAgent } from "./auth.js";
 import { recordLog } from "./audit.js";
 import { fulfilOrder } from "./fulfilment.js";
@@ -28,132 +28,11 @@ function directStatus(payment) {
  * confirmed it. Retained only for historical agent-direct payment claims;
  * new storefront checkouts use platform collection.
  */
-export async function bookAgentWalletStorefrontOrder(claimed, session, options = {}) {
-  const [store, owner] = await Promise.all([
-    Store.findOne({ _id: claimed.store, agent: claimed.agent }).session(session),
-    Agent.findOne({ _id: claimed.agent, status: "active" }).session(session),
-  ]);
-  if (!store || !owner || store.status !== "active") {
-    throw new DirectPaymentError("This storefront is not available for fulfilment.", 409);
-  }
-
-  const walletDebit = money(claimed.platformPrice);
-  const debitedAgent = await Agent.findOneAndUpdate(
-    { _id: owner._id, wallet: { $gte: walletDebit } },
-    { $inc: { wallet: -walletDebit } },
-    { new: true, session }
+export async function bookAgentWalletStorefrontOrder() {
+  throw new DirectPaymentError(
+    "Agent-funded storefront fulfilment is disabled. Contact platform support about this older payment.",
+    410
   );
-  if (!debitedAgent) {
-    throw new DirectPaymentError(
-      `Insufficient wallet balance. Add at least GH₵${walletDebit.toFixed(2)} to fulfil this sale.`,
-      402
-    );
-  }
-
-  const superadmin = await Agent.findOne({ role: "superadmin" })
-    .sort({ createdAt: 1 })
-    .session(session);
-
-  const customerResult = await Customer.updateOne(
-    { agent: owner._id, phone: claimed.phone },
-    {
-      $setOnInsert: { name: claimed.payerName || claimed.phone },
-      $set: { store: store.name },
-      $inc: { orders: 1, spent: claimed.amount },
-    },
-    { upsert: true, session }
-  );
-  const newCustomer = Boolean(customerResult.upsertedCount);
-
-  const [order] = await Order.create(
-    [
-      {
-        agent: owner._id,
-        ref: claimed.reference,
-        store: store.name,
-        customer: claimed.payerName || claimed.phone,
-        phone: claimed.phone,
-        carrier: claimed.network,
-        bundle: `${claimed.gb} GB`,
-        gb: claimed.gb,
-        amount: claimed.amount,
-        earning: claimed.agentMargin,
-        platformEarning: claimed.platformMargin,
-        status: "pending",
-        paymentProvider: claimed.provider,
-        paymentReference: claimed.reference,
-        reversal: {
-          agent: owner._id,
-          agentName: owner.name,
-          agentWalletAdjustment: walletDebit,
-          platformWalletAdjustment: superadmin ? money(-claimed.platformMargin) : 0,
-          storeId: store._id,
-          newCustomer,
-        },
-      },
-    ],
-    { session, ordered: true }
-  );
-
-  await Transaction.create(
-    [
-      {
-        agentId: owner._id,
-        agent: owner.name,
-        store: store.name,
-        type: "purchase",
-        description: `Store fulfilment · ${claimed.network} ${claimed.gb}GB`,
-        amount: -walletDebit,
-        reference: `${claimed.reference}-wallet-debit`,
-      },
-    ],
-    { session, ordered: true }
-  );
-
-  if (superadmin && claimed.platformMargin !== 0) {
-    await Agent.updateOne(
-      { _id: superadmin._id },
-      { $inc: { wallet: claimed.platformMargin } },
-      { session }
-    );
-    await Transaction.create(
-      [
-        {
-          agentId: superadmin._id,
-          agent: superadmin.name,
-          store: store.name,
-          type: claimed.platformMargin > 0 ? "commission" : "fee",
-          description: `Platform commission · ${store.name} · ${claimed.network} ${claimed.gb}GB`,
-          amount: claimed.platformMargin,
-          reference: `${claimed.reference}-platform`,
-        },
-      ],
-      { session, ordered: true }
-    );
-  }
-
-  await Store.updateOne(
-    { _id: store._id },
-    {
-      $inc: {
-        orders: 1,
-        revenue: claimed.amount,
-        customers: newCustomer ? 1 : 0,
-      },
-    },
-    { session }
-  );
-
-  claimed.status = "fulfilling";
-  claimed.order = order._id;
-  claimed.settledAt = new Date();
-  if (options.confirmedBy) {
-    claimed.confirmedBy = options.confirmedBy;
-    claimed.confirmedAt = new Date();
-  }
-  await claimed.save({ session });
-
-  return { action: "fulfil", paymentId: claimed._id, agentId: owner._id, orderId: order._id };
 }
 
 export async function dispatchAgentWalletOrder(orderId) {

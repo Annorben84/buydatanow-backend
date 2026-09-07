@@ -24,7 +24,7 @@ export function portalPurchaseEconomics(options) {
   };
 }
 
-/** Legacy shape retained for reading pre-Paystack wallet-order code. */
+/** Exact wallet debit and full refund amount for portal purchases. */
 export function walletPurchaseEconomics(options) {
   const { amount, agentMargin } = portalPurchaseEconomics(options);
   return { amount, agentMargin, refundAmount: amount };

@@ -54,6 +54,17 @@ export async function settleVerifiedPayment(reference, gatewayData) {
       return { action: "existing", paymentId: intent._id, agentId: intent.agent, orderId: intent.order };
     }
 
+    if (intent.purpose === "storefront_order" && (
+      intent.provider !== "paystack" ||
+      intent.paymentDestination !== "platform" ||
+      intent.settlementModel !== "platform_collected"
+    )) {
+      throw new PaymentSettlementError(
+        "This older checkout requires platform support review. Storefront sales cannot debit an agent wallet.",
+        409
+      );
+    }
+
     const mismatch = paymentMismatch(intent, gatewayData);
     if (mismatch) {
       intent.status = gatewayData?.status === "success" ? "failed" : "initialized";

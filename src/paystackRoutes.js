@@ -79,6 +79,9 @@ router.post("/init", async (req, res, next) => {
       currency: "GHS",
       email: req.agent.email,
       agent: req.agent._id,
+      paymentDestination: "platform",
+      verificationMode: "gateway",
+      settlementModel: "platform_collected",
     });
 
     const { ok, json } = await paystack("/transaction/initialize", {
@@ -122,6 +125,11 @@ router.post("/init", async (req, res, next) => {
 /** Start an authenticated portal purchase collected by the platform Paystack account. */
 router.post("/purchase/init", async (req, res, next) => {
   try {
+    if (req.agent.role !== "superadmin") {
+      return res.status(410).json({
+        error: "Agent portal purchases use Balance Left. Deposit funds first, then try again.",
+      });
+    }
     const liveFulfilment = netpluseLive();
     if (!liveFulfilment && !netpluseSimulatedSalesAllowed()) {
       return res.status(503).json({ error: "Data delivery is temporarily unavailable." });
