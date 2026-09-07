@@ -21,6 +21,7 @@ import { fulfilOrder, reverseOrder, syncNetpluseOrder } from "./lib/fulfilment.j
 import { validPhone, normalizePhone } from "./lib/netpluseApi.js";
 import { canSetSellingPrice } from "./lib/pricingPolicy.js";
 import { getSettings, publicSettings } from "./lib/settings.js";
+import { Notification } from "./models/Notification.js";
 
 const router = Router();
 
@@ -575,6 +576,30 @@ if (false) router.post("/stores/slug/:slug/pay/verify", async (req, res, next) =
  * ===================================================================== */
 router.use(requireAuth);
 
+router.get("/notifications", async (req, res, next) => {
+  try {
+    const filter = { agent: req.agent._id };
+    const [items, unreadCount] = await Promise.all([
+      Notification.find(filter).sort({ readAt: 1, createdAt: -1, _id: -1 }).limit(100).lean(),
+      Notification.countDocuments({ ...filter, readAt: null }),
+    ]);
+    res.json({ data: { items, unreadCount } });
+  } catch (err) { next(err); }
+});
+
+router.patch("/notifications/:id/read", async (req, res, next) => {
+  try {
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(400).json({ error: "Invalid notification" });
+    const item = await Notification.findOneAndUpdate(
+      { _id: req.params.id, agent: req.agent._id },
+      { $set: { readAt: new Date() } },
+      { new: true }
+    );
+    if (!item) return res.status(404).json({ error: "Notification not found" });
+    res.json({ data: item });
+  } catch (err) { next(err); }
+});
+
 /* Stores — each agent sees and manages only their own. */
 const store = crudScoped(Store);
 const storeFields = [
@@ -694,24 +719,18 @@ router.put("/my-prices", async (req, res, next) => {
 });
 
 /*
- * The agent's own Buy Data catalog — active platform bundles priced with the
- * agent's OWN selling prices (their AgentPrice rows), falling back to the
- * platform price where they haven't set one. Same shape as /bundles so
- * BundlesProvider can consume it directly.
+ * Agent purchases use the superadmin's platform price. Custom AgentPrice
+ * rows apply only to storefront customer sales, never this purchase catalog.
  */
 router.get("/my-bundles", async (req, res, next) => {
   try {
-    const [bundles, prices] = await Promise.all([
-      Bundle.find({ active: true }).lean(),
-      AgentPrice.find({ agent: req.agent._id }).lean(),
-    ]);
-    const own = new Map(prices.map((p) => [`${p.carrier}-${p.gb}`, p.price]));
+    const bundles = await Bundle.find({ active: true }).lean();
     const data = bundles.map((b) => ({
       _id: b._id,
       carrier: b.carrier,
       gb: b.gb,
       size: b.size,
-      price: own.get(`${b.carrier}-${b.gb}`) ?? b.price,
+      price: b.price,
       active: true,
     }));
     res.json({ data });

@@ -18,6 +18,7 @@ import { invalidateMaintenanceModeCache } from "./middleware/maintenanceMode.js"
 import { recordLog } from "./lib/audit.js";
 import { getSettings } from "./lib/settings.js";
 import { withMongoTransaction } from "./lib/mongoTransaction.js";
+import { notifyPriceChange } from "./lib/priceNotifications.js";
 import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import {
@@ -736,8 +737,24 @@ router.patch("/bundles/:id", async (req, res, next) => {
     }
     if (typeof req.body?.active === "boolean") doc.active = req.body.active;
 
-    await doc.save();
-    res.json({ data: doc });
+    const saved = await withMongoTransaction(async (session) => {
+      const current = await Bundle.findById(req.params.id).session(session);
+      if (!current) {
+        const error = new Error("Bundle no longer exists");
+        error.status = 404;
+        throw error;
+      }
+      const previous = current.price;
+      if (Object.hasOwn(req.body || {}, "price")) {
+        current.price = doc.price;
+        current.cost = doc.cost;
+      }
+      if (typeof req.body?.active === "boolean") current.active = req.body.active;
+      await current.save({ session });
+      await notifyPriceChange(`${current.carrier} ${current.gb} GB agent price`, previous, current.price, session);
+      return current;
+    });
+    res.json({ data: saved });
   } catch (err) {
     next(err);
   }
@@ -864,10 +881,16 @@ router.put("/provider/checkers/waec/margin", async (req, res, next) => {
       return res.status(400).json({ error: "Enter a margin between GHS 0.00 and GHS 1,000.00." });
     }
 
+    const before = await waecCheckerPricing();
     const settings = await getSettings();
-    settings.waecCheckerMargin = money(margin);
-    await settings.save();
-    const pricing = await waecCheckerPricing();
+    await withMongoTransaction(async (session) => {
+      const current = await settings.constructor.findById(settings._id).session(session);
+      const previous = money(before.baseCost + (Number(current.waecCheckerMargin) || 0));
+      current.waecCheckerMargin = money(margin);
+      await current.save({ session });
+      await notifyPriceChange("WAEC Result Checker price", previous, money(before.baseCost + money(margin)), session);
+    });
+    const pricing = { ...before, margin: money(margin), sellingPrice: money(before.baseCost + money(margin)) };
     recordLog(
       "info",
       `WAEC checker margin updated · GHS ${pricing.margin.toFixed(2)} · selling price GHS ${pricing.sellingPrice.toFixed(2)}`,
