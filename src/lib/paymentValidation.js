@@ -24,6 +24,12 @@ export function paymentMismatch(intent, data) {
   if (asText(metadata.purpose) !== asText(intent.purpose)) return "Payment purpose mismatch.";
   if (asText(metadata.agentId) !== asText(intent.agent)) return "Payment account mismatch.";
 
+  if (intent.purpose === "checker_order") {
+    if (asText(metadata.checkerType) !== asText(intent.checkerType)) return "Checker type mismatch.";
+    if (Number(metadata.checkerQuantity) !== Number(intent.checkerQuantity)) return "Checker quantity mismatch.";
+    if (asText(metadata.storeSlug) !== asText(intent.storeSlug)) return "Checker store mismatch.";
+  }
+
   if (["storefront_order", "portal_order"].includes(intent.purpose)) {
     if (intent.purpose === "storefront_order") {
       if (asText(metadata.storeSlug).toLowerCase() !== asText(intent.storeSlug).toLowerCase()) {

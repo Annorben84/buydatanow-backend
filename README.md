@@ -47,6 +47,84 @@ API runs on `http://localhost:5000`. Check `http://localhost:5000/api/health`.
 
 ## Endpoints
 
+### Result checker purchases
+
+Agents buy WAEC and BECE PINs using their wallets at `/agent/result-checkers`.
+Superadmins can buy at provider cost at `/admin/result-checkers` and set separate
+WAEC/BECE margins in `/admin/waec-result-checker`. BECE's initial margin is zero.
+The existing `NETPLUSE_API_KEY` is used server-side; checker purchases call the
+provider directly and are not simulated by the data-delivery simulation switch.
+
+- `GET /api/checkers`: authenticated live catalog and role-specific prices.
+- `POST /api/checkers/purchase`: `{ type: "waec" | "bece", quantity: 1..50,
+  unitPrice: <displayed quote>, reference: <unique 8–100 character retry key> }`.
+  Quantity is also subject to the provider's tier/stock limits. Reuse the exact
+  reference and parameters after a timeout. The server owns the actual price.
+- `GET /api/checkers/history?page=1&type=waec`: buyer-scoped, paginated history
+  without PINs. The type filter is optional.
+- `GET /api/checkers/:reference`: buyer-only saved purchase and PINs. Pending
+  purchases reconcile against Netpluse; the UI polls this endpoint.
+- `GET /api/admin/provider/checkers/:type` and
+  `PUT /api/admin/provider/checkers/:type/margin`: live costs and margin controls.
+- `POST /api/admin/checkers/sync`: superadmin-only recovery of up to 10 pending
+  checker purchases. Repeated calls are safe.
+
+The wallet debit, intent, and ledger entry are transactional (MongoDB replica
+set required, as for existing wallet flows). Returned PINs are persisted before
+earnings settlement and before responding to the client. Purchase retries use
+the same upstream idempotency reference. Completed deliveries credit the
+superadmin's margin once; confirmed failures refund the buyer once. Timeouts,
+unknown statuses, missing PINs, and provider holds remain pending for recovery.
+
+The existing fulfilment poller also recovers pending checkers on an always-on
+server. On serverless hosts, buyer polling and the authenticated admin sync
+endpoint provide recovery; warm-instance timers alone are not a durable schedule.
+No Netpluse checker webhook is required or registered. Do not log provider responses or
+include PINs in shared history/analytics. The database contains the saved PINs;
+restrict database access and include this collection in the normal backup policy.
+
+#### Public sales and agent storefront margins
+
+The homepage and `/result-checkers` offer guest checkout via platform Paystack.
+Each store links to `/store/:slug/result-checkers`, where the customer's unit
+price is the current platform checker price plus the store owner's saved margin.
+Agents set separate, non-negative WAEC/BECE margins under **Result Checkers →
+Your storefront margins**; unset margins are zero and apply across their stores.
+Homepage sales use the platform price without an agent margin.
+
+- `GET /api/checkers/margins` and `PUT /api/checkers/margins/:type` with
+  `{ margin: <GHS per PIN> }`: authenticated, owner-scoped margin controls.
+- `GET /api/public/checkers?store=slug`: public live prices; omit the store for
+  platform sales.
+- `POST /api/public/checkers/checkout`: `{ type, quantity, unitPrice, email,
+  storeSlug, accessKey }`. `storeSlug` is optional. The browser generates a
+  private 32-byte random key encoded as 64 lowercase hex characters, persists it
+  before initializing checkout, and reuses it when retrying the same purchase.
+- `GET /api/public/checkers/purchases/:reference` with `X-Checker-Key`: verifies
+  payment, reconciles delivery, and returns the customer's saved PINs. A public
+  reference alone never reveals PINs. Only a hash of the recovery key is stored
+  by the backend. Never put this key in URLs, payment metadata, logs or analytics.
+
+The existing signed Paystack `charge.success` webhook also handles
+`checker_order` payments. Type, quantity, store, owner, currency and charged
+amount are verified against the saved intent before any PIN purchase. Customer
+payment fees are shown separately before redirecting to Paystack. Public sales
+never debit the agent wallet. After delivery, the agent's commission goes to
+`commissionAvailable`, and the platform margin (with gateway fee accounting)
+goes to the superadmin wallet exactly once. Failed public deliveries refund the
+original Paystack payment instead of crediting an internal wallet. Ambiguous
+refund requests remain pending; definite refund failures need support review.
+
+Guest PINs are excluded from agents' wallet-purchase history and detail APIs.
+Customers can download a private recovery receipt before paying. Keep it: the
+receipt plus the original browser's local storage are the supported recovery
+methods; this implementation does not email PINs or recovery keys.
+
+`npm run test:checkers` (frontend root) runs the isolated mock-API browser suite.
+It does not use real Paystack or Netpluse purchases.
+
+### Other endpoints
+
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/api/health` | Status + DB connection state |

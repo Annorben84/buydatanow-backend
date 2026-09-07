@@ -11,6 +11,7 @@ import { recordLog } from "./audit.js";
 import { withMongoTransaction } from "./mongoTransaction.js";
 import { requestPaystackRefundForOrder } from "./paystackRefund.js";
 import { platformCollectedEarnings } from "./platformEarnings.js";
+import { syncPendingCheckerPurchases } from "./checkerPurchases.js";
 import {
   netpluseBuyData,
   netpluseConfigured,
@@ -591,6 +592,7 @@ export function startFulfilmentPoller() {
     running = true;
     try {
       await syncPendingOrders();
+      await syncPendingCheckerPurchases();
     } catch (err) {
       console.error("⚠ Fulfilment sync failed:", err?.message || err);
     } finally {

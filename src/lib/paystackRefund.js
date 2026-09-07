@@ -17,14 +17,14 @@ export async function requestPaystackRefundForPayment(payment, reason) {
       transaction: payment.reference,
       amount: Math.round(Number(payment.chargedAmount ?? payment.amount) * 100),
       currency: payment.currency || "GHS",
-      customer_note: "This payment could not be safely matched to your checkout.",
+      customer_note: payment.purpose === "checker_order" ? "Your result checker purchase could not be completed." : "This payment could not be safely matched to your checkout.",
       merchant_note: `Automatic refund: ${reason}`,
     }),
   });
   if (!ok || !json?.status) {
     const message = json?.message || "Could not request the Paystack refund.";
     await Payment.updateOne(
-      { _id: payment._id },
+      { _id: payment._id, status: { $ne: "refunded" } },
       { $set: { status: transportError ? "refund_pending" : "refund_failed", failureReason: message } }
     );
     recordLog("error", `Paystack unmatched-payment refund failed · ${payment.reference} · ${message}`, "payments/refunds");
@@ -34,7 +34,8 @@ export async function requestPaystackRefundForPayment(payment, reason) {
   const providerStatus = String(json.data?.status || "pending");
   const completed = ["processed", "success", "completed"].includes(providerStatus.toLowerCase());
   await Payment.updateOne(
-    { _id: payment._id },
+    // A signed refund webhook can arrive before this API response.
+    { _id: payment._id, status: { $ne: "refunded" } },
     { $set: { status: completed ? "refunded" : "refund_pending" } }
   );
   recordLog("warning", `Paystack unmatched payment refund queued · ${payment.reference}`, "payments/refunds");

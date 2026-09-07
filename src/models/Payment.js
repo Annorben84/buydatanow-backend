@@ -15,7 +15,7 @@ const PaymentSchema = new Schema(
     provider: { type: String, enum: ["paystack", "agent_direct"], default: "paystack" },
     purpose: {
       type: String,
-      enum: ["wallet_topup", "storefront_order", "portal_order"],
+      enum: ["wallet_topup", "storefront_order", "portal_order", "checker_order"],
       required: true,
     },
     status: {
@@ -73,6 +73,12 @@ const PaymentSchema = new Schema(
     agentMargin: { type: Number, default: 0 },
     platformMargin: { type: Number, default: 0 },
     order: { type: Schema.Types.ObjectId, ref: "Order" },
+    checkerPurchase: { type: Schema.Types.ObjectId, ref: "CheckerPurchase" },
+    checkerType: { type: String, enum: ["waec", "bece"] },
+    checkerQuantity: { type: Number, min: 1, max: 50 },
+    checkerAccessHash: { type: String, select: false },
+    checkerCheckoutUrl: { type: String, default: "", select: false },
+    checkerInitLeaseUntil: { type: Date, default: null },
     paystackId: { type: String, default: "" },
     gatewayFee: { type: Number, default: 0 },
     gatewayStatus: { type: String, default: "" },

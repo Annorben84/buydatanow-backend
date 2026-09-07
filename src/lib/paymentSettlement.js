@@ -13,6 +13,8 @@ import { requestPaystackRefundForPayment } from "./paystackRefund.js";
 import { paymentMismatch } from "./paymentValidation.js";
 import { recordLog } from "./audit.js";
 import { bookAgentWalletStorefrontOrder } from "./directPaymentSettlement.js";
+import { CheckerPurchase } from "../models/CheckerPurchase.js";
+import { syncCheckerPurchase } from "./checkerPurchases.js";
 
 const money = (n) => Math.round(Number(n) * 100) / 100;
 
@@ -95,6 +97,21 @@ export async function settleVerifiedPayment(reference, gatewayData) {
     const feeRecovery = money(
       Number(claimed.chargedAmount ?? claimed.amount) - Number(claimed.amount)
     );
+
+    if (claimed.purpose === "checker_order") {
+      const [purchase] = await CheckerPurchase.create([{
+        agent: claimed.agent, reference: claimed.reference, clientReference: claimed.reference,
+        type: claimed.checkerType, quantity: claimed.checkerQuantity,
+        unitPrice: money(claimed.amount / claimed.checkerQuantity), amount: claimed.amount,
+        providerCost: claimed.providerCost, channel: "public", paymentReference: claimed.reference,
+        agentMargin: claimed.agentMargin,
+      }], { session, ordered: true });
+      claimed.status = "fulfilling";
+      claimed.checkerPurchase = purchase._id;
+      claimed.settledAt = new Date();
+      await claimed.save({ session });
+      return { action: "checker", paymentId: claimed._id, checkerId: purchase._id };
+    }
 
     if (claimed.purpose === "wallet_topup") {
       const agent = await Agent.findByIdAndUpdate(
@@ -423,6 +440,11 @@ export async function settleVerifiedPayment(reference, gatewayData) {
         });
       }
     }
+  }
+
+  if (transactionResult.action === "checker") {
+    try { await syncCheckerPurchase(transactionResult.checkerId); }
+    catch { /* The paid intent is durable; customer polling and the recovery worker retry it. */ }
   }
 
   const payment = await Payment.findById(transactionResult.paymentId).lean();

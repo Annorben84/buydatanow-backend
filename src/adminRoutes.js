@@ -20,6 +20,7 @@ import { getSettings } from "./lib/settings.js";
 import { withMongoTransaction } from "./lib/mongoTransaction.js";
 import { notifyPriceChange } from "./lib/priceNotifications.js";
 import { providerCostChange, syncBundleCost } from "./lib/bundleCostSync.js";
+import { syncPendingCheckerPurchases } from "./lib/checkerPurchases.js";
 import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import {
@@ -35,6 +36,11 @@ const router = Router();
 
 // Everything under /api/admin needs a signed-in superadmin.
 router.use(requireAdmin);
+
+router.post("/checkers/sync", async (_req, res, next) => {
+  try { res.json({ data: await syncPendingCheckerPurchases() }); }
+  catch (error) { next(error); }
+});
 
 const money = (n) => Math.round(n * 100) / 100;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -843,20 +849,23 @@ router.get("/provider/wholesale-bundles", async (_req, res, next) => {
   }
 });
 
-async function waecCheckerPricing() {
+async function resultCheckerPricing(type = "waec") {
+  if (!["waec", "bece"].includes(type)) {
+    throw Object.assign(new Error("Choose WAEC or BECE."), { status: 400 });
+  }
   if (!netpluseConfigured()) {
     const error = new Error("Netpluse isn't configured.");
     error.status = 409;
     throw error;
   }
   const [checkers, settings] = await Promise.all([netpluseCheckers(), getSettings()]);
-  const checker = checkers.find((item) => item.id === "waec");
+  const checker = checkers.find((item) => item.id === type);
   if (!checker) {
-    const error = new Error("Netpluse does not currently list the WAEC Result Checker.");
+    const error = new Error(`Netpluse does not currently list the ${type.toUpperCase()} Result Checker.`);
     error.status = 502;
     throw error;
   }
-  const margin = money(Number(settings.waecCheckerMargin) || 0);
+  const margin = money(Number(settings[`${type}CheckerMargin`]) || 0);
   return {
     ...checker,
     baseCost: money(checker.price),
@@ -865,37 +874,38 @@ async function waecCheckerPricing() {
   };
 }
 
-/** GET /api/admin/provider/checkers/waec — live cost plus the platform margin. */
-router.get("/provider/checkers/waec", async (_req, res, next) => {
+/** GET /api/admin/provider/checkers/:type — live cost plus the platform margin. */
+router.get("/provider/checkers/:type", async (req, res, next) => {
   try {
-    res.json({ data: await waecCheckerPricing() });
+    res.json({ data: await resultCheckerPricing(req.params.type) });
   } catch (err) {
     next(err);
   }
 });
 
-/** PUT /api/admin/provider/checkers/waec/margin — set the WAEC selling margin. */
-router.put("/provider/checkers/waec/margin", async (req, res, next) => {
+/** PUT /api/admin/provider/checkers/:type/margin — set a checker's selling margin. */
+router.put("/provider/checkers/:type/margin", async (req, res, next) => {
   try {
     const margin = Number(req.body?.margin);
     if (!Number.isFinite(margin) || margin < 0 || margin > 1000) {
       return res.status(400).json({ error: "Enter a margin between GHS 0.00 and GHS 1,000.00." });
     }
 
-    const before = await waecCheckerPricing();
+    const type = req.params.type;
+    const before = await resultCheckerPricing(type);
     const settings = await getSettings();
     await withMongoTransaction(async (session) => {
       const current = await settings.constructor.findById(settings._id).session(session);
-      const previous = money(before.baseCost + (Number(current.waecCheckerMargin) || 0));
-      current.waecCheckerMargin = money(margin);
+      const previous = money(before.baseCost + (Number(current[`${type}CheckerMargin`]) || 0));
+      current[`${type}CheckerMargin`] = money(margin);
       await current.save({ session });
-      await notifyPriceChange("WAEC Result Checker price", previous, money(before.baseCost + money(margin)), session);
+      await notifyPriceChange(`${type.toUpperCase()} Result Checker price`, previous, money(before.baseCost + money(margin)), session);
     });
     const pricing = { ...before, margin: money(margin), sellingPrice: money(before.baseCost + money(margin)) };
     recordLog(
       "info",
-      `WAEC checker margin updated · GHS ${pricing.margin.toFixed(2)} · selling price GHS ${pricing.sellingPrice.toFixed(2)}`,
-      "admin/provider/checkers/waec"
+      `${type.toUpperCase()} checker margin updated · GHS ${pricing.margin.toFixed(2)} · selling price GHS ${pricing.sellingPrice.toFixed(2)}`,
+      `admin/provider/checkers/${type}`
     );
     res.json({ data: pricing });
   } catch (err) {

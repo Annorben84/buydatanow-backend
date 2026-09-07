@@ -261,3 +261,19 @@ export async function netpluseOrderStatus(providerRef) {
     cost: Number(data?.price) || 0,
   };
 }
+
+/** Keep PIN-bearing responses server-side; callers persist them before responding. */
+export async function netplusePurchaseCheckers({ type, quantity, reference }) {
+  return netpluse("/checkers/purchase", {
+    method: "POST",
+    body: JSON.stringify({ type, quantity, reference }),
+  });
+}
+
+export async function netpluseCheckerPurchase(reference) {
+  return netpluse(`/checkers/${encodeURIComponent(reference)}`);
+}
+
+export async function netpluseCheckerOrderStatus(reference) {
+  return netpluse(`/order-status/${encodeURIComponent(reference)}`);
+}

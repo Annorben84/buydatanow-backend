@@ -12,6 +12,8 @@ import routes from "./routes.js";
 import authRoutes from "./authRoutes.js";
 import adminRoutes from "./adminRoutes.js";
 import walletRoutes from "./walletRoutes.js";
+import checkerRoutes from "./checkerRoutes.js";
+import publicCheckerRoutes from "./publicCheckerRoutes.js";
 import paystackRoutes from "./paystackRoutes.js";
 import storefrontPaymentRoutes from "./storefrontPaymentRoutes.js";
 import { paystackWebhook } from "./paystackWebhook.js";
@@ -97,6 +99,8 @@ app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/wallet/paystack", paystackRoutes);
 app.use("/api/wallet", walletRoutes);
+app.use("/api/checkers", checkerRoutes);
+app.use("/api/public/checkers", publicCheckerRoutes);
 // Mounted before the legacy catch-all routes so unsafe historical purchase
 // handlers can never be reached.
 app.use("/api", storefrontPaymentRoutes);
