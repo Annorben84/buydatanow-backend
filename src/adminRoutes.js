@@ -19,6 +19,7 @@ import { recordLog } from "./lib/audit.js";
 import { getSettings } from "./lib/settings.js";
 import { withMongoTransaction } from "./lib/mongoTransaction.js";
 import { notifyPriceChange } from "./lib/priceNotifications.js";
+import { providerCostChange, syncBundleCost } from "./lib/bundleCostSync.js";
 import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import {
@@ -905,7 +906,8 @@ router.put("/provider/checkers/waec/margin", async (req, res, next) => {
 /**
  * POST /api/admin/provider/sync-costs — pull Netpluse prices into `Bundle.cost`
  * so the platform margin shown on the dashboard reflects what we actually pay.
- * Selling prices are never touched. `?dryRun=1` reports without writing.
+ * Cost increases raise agent prices by the same GHS amount to preserve margin.
+ * Cost decreases leave agent prices unchanged. `?dryRun=1` previews both prices.
  */
 router.post("/provider/sync-costs", async (req, res, next) => {
   try {
@@ -929,9 +931,10 @@ router.post("/provider/sync-costs", async (req, res, next) => {
         unmatched.push({ carrier: b.carrier, gb: b.gb });
         continue;
       }
-      if (money(cost) === money(b.cost || 0)) continue;
-      changed.push({ carrier: b.carrier, gb: b.gb, from: money(b.cost || 0), to: money(cost) });
-      if (!dryRun) await Bundle.updateOne({ _id: b._id }, { $set: { cost: money(cost) } });
+      const change = dryRun
+        ? providerCostChange(b, cost)
+        : await syncBundleCost(b._id, cost);
+      if (change) changed.push(change);
     }
 
     if (!dryRun && changed.length) {
