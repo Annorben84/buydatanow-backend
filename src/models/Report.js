@@ -10,6 +10,7 @@ const { Schema, model } = mongoose;
  */
 const ReportSchema = new Schema(
   {
+    agent: { type: Schema.Types.ObjectId, ref: "Agent", default: null },
     reference: { type: String, required: true, unique: true, trim: true },
     name: { type: String, required: true, trim: true },
     phone: { type: String, default: "", trim: true },
@@ -23,6 +24,8 @@ const ReportSchema = new Schema(
   },
   { timestamps: true }
 );
+
+ReportSchema.index({ agent: 1, createdAt: -1 });
 
 export const Report = model("Report", ReportSchema);
 export default Report;

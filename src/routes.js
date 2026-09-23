@@ -14,7 +14,7 @@ import {
 } from "./models/index.js";
 import { crud } from "./lib/crud.js";
 import { crudScoped } from "./lib/crudScoped.js";
-import { requireAuth } from "./lib/auth.js";
+import { hashPassword, requireAuth } from "./lib/auth.js";
 import { recordLog } from "./lib/audit.js";
 import { paystack, paystackConfigured, clientOrigin } from "./lib/paystackApi.js";
 import { fulfilOrder, reverseOrder, syncNetpluseOrder } from "./lib/fulfilment.js";
@@ -36,6 +36,7 @@ router.get("/settings", async (req, res, next) => {
 });
 
 const money = (n) => Math.round(n * 100) / 100;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /** Human-friendly tracking reference (no easily-confused chars). */
 function makeReference() {
@@ -576,6 +577,76 @@ if (false) router.post("/stores/slug/:slug/pay/verify", async (req, res, next) =
  * ===================================================================== */
 router.use(requireAuth);
 
+/** Create a support report owned by the signed-in agent. */
+router.post("/agent-reports", async (req, res, next) => {
+  try {
+    const name = String(req.body.name || req.agent.name || "").trim();
+    const phone = String(req.body.phone || req.agent.phone || "").trim();
+    const email = String(req.body.email || req.agent.email || "").trim().toLowerCase();
+    const category = String(req.body.category || "").trim();
+    const description = String(req.body.description || "").trim();
+    const orderRef = String(req.body.orderRef ?? req.body.reference ?? "").trim();
+
+    if (name.length < 2) return res.status(400).json({ error: "Please enter your name." });
+    if (!validPhone(phone)) {
+      return res.status(400).json({ error: "Enter a valid Ghana phone number." });
+    }
+    if (!category) return res.status(400).json({ error: "Choose an issue type." });
+    if (description.length < 10) {
+      return res.status(400).json({ error: "Tell us what happened (at least 10 characters)." });
+    }
+
+    const reference = makeReference();
+    const report = await Report.create({
+      agent: req.agent._id,
+      reference,
+      name,
+      phone,
+      phoneNormalized: normalizePhone(phone),
+      email,
+      orderRef,
+      category,
+      description,
+      priority: priorityFor(category),
+    });
+
+    recordLog("info", `New agent support ticket · ${category} · ${reference}`, "agent/reports", {
+      agent: String(req.agent._id),
+      report: String(report._id),
+    });
+    res.status(201).json({ data: { reference: report.reference } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** List only support reports submitted by the signed-in agent. */
+router.get("/agent-reports", async (req, res, next) => {
+  try {
+    const reports = await Report.find({ agent: req.agent._id })
+      .select("reference orderRef category description priority status createdAt updatedAt")
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean();
+
+    res.json({
+      data: reports.map((report) => ({
+        id: String(report._id),
+        reference: report.reference,
+        orderRef: report.orderRef || "",
+        category: report.category,
+        description: report.description,
+        priority: report.priority,
+        status: report.status,
+        createdAt: report.createdAt,
+        updatedAt: report.updatedAt,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/notifications", async (req, res, next) => {
   try {
     const filter = { agent: req.agent._id };
@@ -1039,6 +1110,71 @@ router.get("/payments", async (req, res, next) => {
   }
 });
 
+/** Create a reseller account directly attached to the signed-in agent. */
+router.post("/sub-agents", async (req, res, next) => {
+  try {
+    const name = String(req.body.name || "").trim();
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const rawPhone = String(req.body.phone || "").trim();
+    const phone = rawPhone ? normalizePhone(rawPhone) : "";
+    const password = String(req.body.password || "");
+    const discount = Number(req.body.discount ?? 0);
+
+    if (name.length < 2) return res.status(400).json({ error: "Please enter a name." });
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "Enter a valid email address." });
+    if (rawPhone && !validPhone(rawPhone)) {
+      return res.status(400).json({ error: "Enter a valid Ghana phone number." });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters." });
+    }
+    if (!Number.isFinite(discount) || discount < 0 || discount > 100) {
+      return res.status(400).json({ error: "Discount must be between 0 and 100%." });
+    }
+
+    const duplicateEmail = await Agent.exists({ email });
+    if (duplicateEmail) {
+      return res.status(409).json({ error: "An account with that email already exists." });
+    }
+    if (phone && await Agent.exists({ phone })) {
+      return res.status(409).json({ error: "An account with that phone number already exists." });
+    }
+
+    const agent = await Agent.create({
+      name,
+      email,
+      phone,
+      passwordHash: await hashPassword(password),
+      parentAgent: req.agent._id,
+      discount: money(discount),
+      role: "agent",
+    });
+
+    recordLog("info", `Sub-agent created · ${agent.name}`, "agent/sub-agents", {
+      agent: String(req.agent._id),
+      subAgent: String(agent._id),
+    });
+    res.status(201).json({
+      data: {
+        id: String(agent._id),
+        name: agent.name,
+        email: agent.email,
+        phone: agent.phone || "",
+        stores: 0,
+        sales: 0,
+        discount: money(agent.discount || 0),
+        status: "active",
+        createdAt: agent.createdAt,
+      },
+    });
+  } catch (err) {
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: "An account with that email already exists." });
+    }
+    next(err);
+  }
+});
+
 /** Resellers directly attached to the signed-in agent, with live sales totals. */
 router.get("/sub-agents", async (req, res, next) => {
   try {
@@ -1065,6 +1201,7 @@ router.get("/sub-agents", async (req, res, next) => {
       data: agents.map((a) => ({
         id: String(a._id),
         name: a.name,
+        email: a.email || "",
         phone: a.phone || "",
         stores: storesByAgent.get(String(a._id)) || 0,
         sales: salesByAgent.get(String(a._id)) || 0,
