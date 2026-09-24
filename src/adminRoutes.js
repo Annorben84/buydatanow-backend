@@ -23,6 +23,7 @@ import { providerCostChange, syncBundleCost } from "./lib/bundleCostSync.js";
 import { syncPendingCheckerPurchases } from "./lib/checkerPurchases.js";
 import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
+import { creditAgentWallet, validateAdminCredit } from "./lib/adminCredit.js";
 import {
   netpluseCatalog,
   netpluseCheckers,
@@ -199,20 +200,45 @@ router.get("/agents", async (req, res, next) => {
       Store.aggregate([{ $group: { _id: "$agent", count: { $sum: 1 } } }]),
     ]);
     const counts = new Map(storeCounts.map((s) => [String(s._id), s.count]));
-    const data = agents.map((a) => ({
-      _id: a._id,
-      name: a.name,
-      email: a.email,
-      phone: a.phone,
-      wallet: a.wallet,
-      revenue: a.revenue,
-      tier: a.tier,
-      status: a.status,
-      role: a.role || "agent",
-      stores: counts.get(String(a._id)) || 0,
-      createdAt: a.createdAt,
-    }));
+    const data = agents.map((a) => agentRow(a, counts.get(String(a._id)) || 0));
     res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** POST /api/admin/agents/:id/credit — manually add funds to an agent wallet. */
+router.post("/agents/:id/credit", async (req, res, next) => {
+  try {
+    const input = validateAdminCredit(req.body);
+    const result = await creditAgentWallet({
+      agentId: req.params.id,
+      ...input,
+      adminName: req.agent.name,
+    });
+
+    if (!result.alreadyCredited) {
+      recordLog(
+        "info",
+        `Agent wallet credited · ${result.agent.name} · ₵${input.amount}`,
+        "admin/agents",
+        {
+          agentId: String(result.agent._id),
+          amount: input.amount,
+          reason: input.reason,
+          reference: result.transaction.reference,
+          creditedBy: String(req.agent._id),
+        }
+      );
+    }
+
+    res.status(result.alreadyCredited ? 200 : 201).json({
+      data: {
+        agent: agentRow(result.agent),
+        transaction: result.transaction,
+        alreadyCredited: result.alreadyCredited,
+      },
+    });
   } catch (err) {
     next(err);
   }
