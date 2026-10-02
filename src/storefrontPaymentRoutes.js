@@ -52,8 +52,9 @@ router.post("/stores/slug/:slug/buy", (_req, res) => {
 });
 
 /**
- * Initialize a platform-collected Paystack checkout. The agent wallet is not
- * involved in a storefront sale.
+ * Initialize a platform-collected Paystack checkout. A storefront sale still
+ * requires the agent's wallet to cover the customer-facing bundle price before
+ * payment can be started.
  */
 router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
   try {
@@ -114,6 +115,11 @@ router.post("/stores/slug/:slug/pay/init", async (req, res, next) => {
       platformPrice,
       providerCost,
     });
+    if (money(owner.wallet || 0) < amount) {
+      return res.status(402).json({
+        error: "Store Balance is low contact Your Store",
+      });
+    }
     const reference = `DP-${randomUUID()}`;
 
     if (!paystackConfigured()) {
