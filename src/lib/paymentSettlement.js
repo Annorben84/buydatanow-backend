@@ -448,6 +448,13 @@ export async function settleVerifiedPayment(reference, gatewayData) {
   }
 
   const payment = await Payment.findById(transactionResult.paymentId).lean();
+  if (transactionResult.action === "wallet") {
+    await recordLog("info", "Wallet top-up credited", "payments/settlement", {
+      reference: payment.reference,
+      amount: payment.amount,
+      agentId: String(payment.agent),
+    });
+  }
   const [agent, order, ledgerTransaction] = await Promise.all([
     payment?.agent ? Agent.findById(payment.agent) : null,
     payment?.order ? Order.findById(payment.order).lean() : null,

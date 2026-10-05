@@ -219,6 +219,21 @@ settled even when the customer's browser never returns from checkout. Financial
 writes use MongoDB transactions: Atlas supports them, while a local MongoDB must
 run as a replica set.
 
+Wallet deposits also recover through server-side Paystack verification when
+the agent or admin opens Add Fund. The return page keeps the reference until
+verification finishes, retries pending payments and temporary errors, and offers
+**Check payment again** if confirmation remains unavailable. Verification allows
+45 seconds for a cold API/database connection plus the gateway request. All
+recovery paths use the same atomic settlement and unique ledger reference, so
+the wallet receives only the deposit principal and repeated attempts cannot
+credit it twice. Settlement and recovery logs include the payment reference.
+
+On always-on hosts, `PAYSTACK_POLL_SECONDS` (default 90; 0 disables it) also
+checks up to 10 unsettled wallet deposits per pass. Recently checked deposits
+rotate behind unchecked ones so old abandoned checkouts cannot block newer
+payments. On serverless hosts this timer is best effort; signed webhooks and
+the authenticated Add Fund recovery flow remain the confirmation paths.
+
 Deploy this service **before** the frontend: `NEXT_PUBLIC_API_URL` is inlined
 into the Next.js bundle at build time, so that build needs this URL to exist.
 

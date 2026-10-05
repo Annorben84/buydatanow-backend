@@ -8,6 +8,7 @@ import { ensureSuperadmin } from "./lib/auth.js";
 import { paystackMode, paystackConfigured } from "./lib/paystackApi.js";
 import { netpluseStatus } from "./lib/netpluseApi.js";
 import { startFulfilmentPoller } from "./lib/fulfilment.js";
+import { startWalletTopupPoller } from "./lib/walletTopupRecovery.js";
 import routes from "./routes.js";
 import authRoutes from "./authRoutes.js";
 import adminRoutes from "./adminRoutes.js";
@@ -51,6 +52,7 @@ async function connectDatabase() {
       // instance. The recovery work is idempotent, so overlapping warm
       // instances cannot dispatch the same pending order twice.
       startFulfilmentPoller();
+      startWalletTopupPoller();
     }
   })().finally(() => {
     databaseConnectionPromise = null;

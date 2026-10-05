@@ -18,6 +18,7 @@ import {
   PaymentSettlementError,
   settleVerifiedPayment,
 } from "./lib/paymentSettlement.js";
+import { pendingWalletTopups, verifyWalletTopup } from "./lib/walletTopupRecovery.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -91,7 +92,7 @@ router.post("/init", async (req, res, next) => {
         amount: charge.totalSubunit,
         currency: "GHS",
         reference,
-        callback_url: `${clientOrigin()}${callbackPath}`,
+        callback_url: `${clientOrigin().replace(/\/$/, "")}${callbackPath}?payment_reference=${encodeURIComponent(reference)}`,
         metadata: {
           agentId: String(req.agent._id),
           purpose: "wallet_topup",
@@ -332,35 +333,24 @@ router.get("/purchase/status/:reference", async (req, res, next) => {
   }
 });
 
+/** Recover owned deposits even when the browser never returned from checkout. */
+router.get("/pending", async (req, res, next) => {
+  try {
+    const payments = await pendingWalletTopups({ agentId: req.agent._id, limit: 5 });
+    res.json({ data: payments });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /** Verify and atomically credit a Paystack top-up exactly once. */
 router.post("/verify", async (req, res, next) => {
   try {
-    if (!paystackConfigured()) {
-      return res.status(500).json({ error: "Paystack is not configured." });
-    }
     const reference = String(req.body?.reference || "").trim();
     if (!reference) return res.status(400).json({ error: "Missing payment reference." });
 
-    const intent = await Payment.findOne({ reference, purpose: "wallet_topup" }).lean();
-    if (!intent) return res.status(404).json({ error: "Payment intent not found." });
-    if (String(intent.agent) !== String(req.agent._id)) {
-      return res.status(403).json({ error: "This payment belongs to another account." });
-    }
-
-    const { ok, json } = await paystack(`/transaction/verify/${encodeURIComponent(reference)}`);
-    if (!ok || !json?.status) {
-      return res.status(502).json({ error: json?.message || "Could not verify the payment." });
-    }
-    if (json.data?.status !== "success") {
-      await Payment.updateOne(
-        { _id: intent._id },
-        { $set: { gatewayStatus: String(json.data?.status || "unknown") } }
-      );
-      return res.json({ data: { status: json.data?.status || "unknown" } });
-    }
-
-    const result = await settleVerifiedPayment(reference, json.data);
-    res.status(result.alreadySettled ? 200 : 201).json({
+    const result = await verifyWalletTopup(reference, { agentId: req.agent._id });
+    res.status(result.status === "success" && !result.alreadySettled ? 201 : 200).json({
       data: {
         status: result.status,
         agent: result.agent,

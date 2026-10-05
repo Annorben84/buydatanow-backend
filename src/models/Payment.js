@@ -82,12 +82,15 @@ const PaymentSchema = new Schema(
     paystackId: { type: String, default: "" },
     gatewayFee: { type: Number, default: 0 },
     gatewayStatus: { type: String, default: "" },
+    lastVerifiedAt: { type: Date, default: null },
     gatewayChannel: { type: String, default: "" },
     failureReason: { type: String, default: "" },
     settledAt: { type: Date },
   },
   { timestamps: true }
 );
+
+PaymentSchema.index({ provider: 1, purpose: 1, status: 1, lastVerifiedAt: 1, createdAt: 1 });
 
 // A provider receipt may be claimed only once per agent. This prevents the
 // same MoMo/bank transaction ID from funding multiple storefront orders.

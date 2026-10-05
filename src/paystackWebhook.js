@@ -60,6 +60,7 @@ export async function paystackWebhook(req, res) {
     return res.sendStatus(200);
   } catch (err) {
     recordLog("error", `Paystack webhook failed · ${event.event}`, "payments/webhook", {
+      reference: String(event.data?.reference || event.data?.transaction?.reference || ""),
       error: err?.message || String(err),
     });
     return res.status(500).json({ error: "Webhook processing failed." });
