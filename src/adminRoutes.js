@@ -207,20 +207,19 @@ router.get("/agents", async (req, res, next) => {
   }
 });
 
-/** POST /api/admin/agents/:id/credit — manually add funds to an agent wallet. */
+/** POST /api/admin/agents/:id/credit — verify and settle a user's Paystack deposit. */
 router.post("/agents/:id/credit", async (req, res, next) => {
   try {
     const input = validateAdminCredit(req.body);
     const result = await creditAgentWallet({
       agentId: req.params.id,
       ...input,
-      adminName: req.agent.name,
     });
 
     if (!result.alreadyCredited) {
       recordLog(
         "info",
-        `Agent wallet credited · ${result.agent.name} · ₵${input.amount}`,
+        `Paystack wallet credit confirmed · ${result.agent.name} · ₵${input.amount} · by ${req.agent.name}`,
         "admin/agents",
         {
           agentId: String(result.agent._id),
