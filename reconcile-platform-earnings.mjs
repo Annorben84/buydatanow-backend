@@ -32,15 +32,16 @@ async function reconcilePlatformEarnings() {
   if (!superadmin) throw new Error("No Superadmin account exists.");
 
   const bundleByKey = new Map(
-    bundles.map((bundle) => [`${bundle.carrier}:${bundle.gb}`, bundle])
+    bundles.map((bundle) => [`${bundle.carrier}:${bundle.gb}`, bundle]),
   );
   const candidates = orders
     .map((order) => {
       const bundle = bundleByKey.get(`${order.carrier}:${order.gb}`);
       if (!bundle) return null;
-      const providerCost = Number(order.providerCost) > 0
-        ? Number(order.providerCost)
-        : Number(bundle.cost);
+      const providerCost =
+        Number(order.providerCost) > 0
+          ? Number(order.providerCost)
+          : Number(bundle.cost);
       const margin = platformBundleMargin({
         platformPrice: bundle.price,
         providerCost,
@@ -62,7 +63,9 @@ async function reconcilePlatformEarnings() {
       if (!order) continue;
 
       const reference = `${order.ref}-platform`;
-      const existingLedgerRow = await Transaction.findOne({ reference }).session(session);
+      const existingLedgerRow = await Transaction.findOne({
+        reference,
+      }).session(session);
 
       await Order.updateOne(
         { _id: order._id },
@@ -72,7 +75,7 @@ async function reconcilePlatformEarnings() {
             "reversal.platformWalletAdjustment": -candidate.margin,
           },
         },
-        { session }
+        { session },
       );
       reconciled += 1;
 
@@ -81,7 +84,7 @@ async function reconcilePlatformEarnings() {
       await Agent.updateOne(
         { _id: superadmin._id },
         { $inc: { wallet: candidate.margin } },
-        { session }
+        { session },
       );
       await Transaction.create(
         [
@@ -94,7 +97,7 @@ async function reconcilePlatformEarnings() {
             reference,
           },
         ],
-        { session, ordered: true }
+        { session, ordered: true },
       );
       credited += candidate.margin;
     }
