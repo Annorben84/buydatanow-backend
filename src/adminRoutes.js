@@ -390,6 +390,64 @@ router.get("/customers", async (req, res, next) => {
   }
 });
 
+/** GET /api/admin/orders — every agent's data orders, including portal purchases. */
+router.get("/orders", async (req, res, next) => {
+  try {
+    const page = Number(req.query.page ?? 1);
+    const pageSize = 50;
+    if (!Number.isSafeInteger(page) || page < 1 || page > 1_000_000) {
+      return res.status(400).json({ error: "Invalid page." });
+    }
+
+    const match = {};
+    const status = String(req.query.status || "");
+    const carrier = String(req.query.carrier || "");
+    if (status) {
+      if (!Order.schema.path("status").enumValues.includes(status)) {
+        return res.status(400).json({ error: "Invalid order status." });
+      }
+      match.status = status;
+    }
+    if (carrier) {
+      if (!Order.schema.path("carrier").enumValues.includes(carrier)) {
+        return res.status(400).json({ error: "Invalid network." });
+      }
+      match.carrier = carrier;
+    }
+
+    const search = String(req.query.q || "").trim().slice(0, 120);
+    if (search) {
+      const pattern = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      const agents = await Agent.find({ name: pattern }).select("_id").lean();
+      match.$or = [
+        ...["ref", "store", "customer", "phone", "providerRef", "paymentReference"].map((field) => ({ [field]: pattern })),
+        { agent: { $in: agents.map((agent) => agent._id) } },
+      ];
+    }
+
+    const [orders, total] = await Promise.all([
+      Order.find(match)
+        .select("ref agent store customer phone carrier bundle amount earning status createdAt providerRef")
+        .sort({ createdAt: -1, _id: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .populate("agent", "name email")
+        .lean(),
+      Order.countDocuments(match),
+    ]);
+
+    const items = orders.map((order) => ({
+      ...order,
+      agent: order.agent ? String(order.agent._id) : null,
+      agentName: order.agent?.name || "—",
+      agentEmail: order.agent?.email || "",
+    }));
+    res.json({ data: { items, total, page, pageSize } });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /** GET /api/admin/transactions — the master ledger, newest first. */
 router.get("/transactions", async (req, res, next) => {
   try {
