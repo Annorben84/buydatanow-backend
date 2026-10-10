@@ -874,7 +874,7 @@ router.get("/provider", async (req, res, next) => {
       netpluseConfigured() ? netpluseWalletBalance() : Promise.resolve({ ok: false }),
       netpluseConfigured() ? netpluseCatalog() : Promise.resolve([]),
     ]);
-    const inFlight = await Order.countDocuments({ status: "processing" });
+    const inFlight = await Order.countDocuments({ status: { $in: ["processing", "on_hold"] } });
 
     res.json({
       data: {

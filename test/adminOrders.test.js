@@ -125,6 +125,19 @@ test("invalid filters are rejected before reading orders", async (t) => {
   assert.equal(state.reads, 0);
 });
 
+test("on-hold orders appear across agents and can be filtered separately", async (t) => {
+  const state = await fixture(t, [
+    order("1", "ama", { status: "on_hold", providerRef: "NP-held-1" }),
+    order("2", "kwame", { status: "on_hold", store: "Kwame Shop" }),
+    order("3", "ama", { status: "processing" }),
+  ]);
+  assert.equal((await state.get()).body.data.total, 3);
+  const result = await state.get("?status=on_hold");
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.total, 2);
+  assert.deepEqual(result.body.data.items.map((row) => row.ref), ["ORDER-2", "ORDER-1"]);
+});
+
 test("ordinary agents and unauthenticated requests cannot read platform orders", async (t) => {
   const state = await fixture(t, [order("1", "ama")]);
   assert.equal((await state.get("", "ama")).status, 403);

@@ -247,6 +247,11 @@ margin, store and customer counters) if delivery fails. Orders come back as
 `processing` and are settled by a background poller, so an order is only
 `completed` once the data has actually gone out.
 
+Provider-held orders are saved as `on_hold` and displayed as **On hold** in the
+agent orders view and the superadmin **All Orders** page. They remain in the
+polling queue until delivery resumes or the provider confirms failure; a hold
+does not trigger a refund or settle delivery earnings.
+
 Three things worth knowing:
 
 - **The configured key is live.** `NETPLUSE_FULFILMENT=auto` sends upstream only

@@ -22,6 +22,7 @@ import {
 } from "./netpluseApi.js";
 
 const money = (n) => Math.round(Number(n) * 100) / 100;
+const inFlightStatuses = ["processing", "on_hold"];
 
 /**
  * Release platform-collected order earnings only after confirmed delivery.
@@ -228,7 +229,7 @@ export async function fulfilOrder(inputOrder, reversal) {
 
   order.provider = "netpluse";
   order.providerRef = result.providerRef;
-  order.providerStatus = result.status;
+  order.providerStatus = result.raw || result.status;
   order.providerMessage = result.message;
   order.providerCost = money(result.cost || 0);
   order.status = result.status;
@@ -239,7 +240,7 @@ export async function fulfilOrder(inputOrder, reversal) {
     await settleCompletedOrderEarnings(order);
     await markPaymentFulfilled(order);
   }
-  if (["completed", "processing"].includes(result.status)) {
+  if (result.status === "completed" || inFlightStatuses.includes(result.status)) {
     recordLog(
       "info",
       `Order sent to Netpluse · ${order.ref} · ${order.carrier} ${order.gb}GB → ${order.phone}`,
@@ -424,7 +425,7 @@ export async function syncNetpluseOrder(inputOrder) {
     };
   }
 
-  if (!order.providerRef && order.status !== "processing") {
+  if (!order.providerRef && !inFlightStatuses.includes(order.status)) {
     return {
       checked: false,
       ok: true,
@@ -444,7 +445,7 @@ export async function syncNetpluseOrder(inputOrder) {
       });
 
   if (!result.ok) {
-    if (order.status === "processing" && retryingPurchase && !result.indeterminate) {
+    if (inFlightStatuses.includes(order.status) && retryingPurchase && !result.indeterminate) {
       order.providerMessage = result.message || "Netpluse rejected the retried order.";
       await settleFailed(order, order.providerMessage);
     }
@@ -468,7 +469,7 @@ export async function syncNetpluseOrder(inputOrder) {
 
   // Terminal local orders are queried for visibility, but never reversed or
   // reopened by a later provider response. Only in-flight orders reconcile.
-  if (order.status !== "processing") {
+  if (!inFlightStatuses.includes(order.status)) {
     await order.save();
     return {
       checked: true,
@@ -481,14 +482,17 @@ export async function syncNetpluseOrder(inputOrder) {
     };
   }
 
-  if (result.status === "processing") {
+  if (inFlightStatuses.includes(result.status)) {
+    order.status = result.status;
     await order.save();
     return {
       checked: true,
       ok: true,
       status: order.status,
       raw: result.raw || result.status,
-      message: result.message || "Netpluse is still processing this order.",
+      message: result.message || (order.status === "on_hold"
+        ? "Netpluse has placed this order on hold. Delivery is paused; we will keep checking for updates."
+        : "Netpluse is still processing this order."),
       providerRef: order.providerRef,
       ...liveOrder,
     };
@@ -560,17 +564,16 @@ export async function syncPendingOrders({ limit = 50 } = {}) {
     };
   }
 
-  const pending = await Order.find({ provider: "netpluse", status: "processing" })
-    .sort({ createdAt: 1 })
+  const pending = await Order.find({ provider: "netpluse", status: { $in: inFlightStatuses } })
+    .sort({ updatedAt: 1, createdAt: 1 })
     .limit(limit);
 
   let delivered = 0;
   let failed = 0;
   for (const order of pending) {
-    const before = order.status;
     const result = await syncNetpluseOrder(order);
-    if (before === "processing" && result.status === "completed") delivered++;
-    if (before === "processing" && ["failed", "refunded"].includes(result.status)) failed++;
+    if (result.status === "completed") delivered++;
+    if (["failed", "refunded"].includes(result.status)) failed++;
   }
 
   return {

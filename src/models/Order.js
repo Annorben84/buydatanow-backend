@@ -18,9 +18,10 @@ const OrderSchema = new Schema(
     status: {
       type: String,
       // processing = handed to the provider, awaiting delivery.
+      // on_hold = paused by the provider, still awaiting delivery.
       // refunded = the provider couldn't deliver and the money was put back.
       // cancelled = the owner stopped a pending order before provider dispatch.
-      enum: ["pending", "processing", "completed", "failed", "refunded", "cancelled"],
+      enum: ["pending", "processing", "on_hold", "completed", "failed", "refunded", "cancelled"],
       default: "pending",
     },
 

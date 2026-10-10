@@ -99,7 +99,12 @@ export function capacityInGb(capacity = "") {
 }
 
 export function mapProviderStatus(status = "") {
-  switch (String(status).toLowerCase()) {
+  switch (String(status).trim().toLowerCase().replace(/[\s-]+/g, "_")) {
+    case "on_hold":
+    case "onhold":
+    case "hold":
+    case "held":
+      return "on_hold";
     case "completed":
     case "success":
     case "delivered":
@@ -232,6 +237,7 @@ export async function netpluseBuyData({ ref, phone, carrier, gb }) {
     message,
     providerRef: String(data?.reference || ""),
     status: ok ? mapProviderStatus(data?.status || "processing") : "failed",
+    raw: String(data?.status || "processing"),
     cost: Number(data?.price) || match.cost,
     balance: data?.balance == null ? null : Number(data.balance),
   };
