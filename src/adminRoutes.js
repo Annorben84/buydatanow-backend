@@ -21,7 +21,7 @@ import { withMongoTransaction } from "./lib/mongoTransaction.js";
 import { notifyPriceChange } from "./lib/priceNotifications.js";
 import { providerCostChange, syncBundleCost } from "./lib/bundleCostSync.js";
 import { syncPendingCheckerPurchases } from "./lib/checkerPurchases.js";
-import { syncPendingOrders, reverseOrder } from "./lib/fulfilment.js";
+import { syncPendingOrders, reverseOrder, canReverseOrder } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import { creditAgentWallet, validateAdminCredit } from "./lib/adminCredit.js";
 import {
@@ -1063,6 +1063,11 @@ router.post("/orders/:ref/reverse", async (req, res, next) => {
     if (!order.reversal?.agent) {
       return res.status(409).json({ error: "This order has no reversal plan recorded." });
     }
+    if (!canReverseOrder(order)) {
+      return res.status(409).json({
+        error: "This order is not eligible for a refund. Processing and held orders must finish with the provider first; pending orders must be cancelled before dispatch.",
+      });
+    }
 
     const { credit, platformClawback } = order.reversal;
     const agentAdjustment = Number.isFinite(order.reversal.agentWalletAdjustment)
@@ -1071,12 +1076,15 @@ router.post("/orders/:ref/reverse", async (req, res, next) => {
     const platformAdjustment = Number.isFinite(order.reversal.platformWalletAdjustment)
       ? order.reversal.platformWalletAdjustment
       : -platformClawback;
-    await reverseOrder(order);
+    const reversed = await reverseOrder(order);
+    if (!reversed) {
+      return res.status(409).json({ error: "No refund was issued. The order changed or its delivery failure could not be confirmed. Refresh its status before trying again." });
+    }
     const settled = await Order.findById(order._id).lean();
 
     recordLog(
       "warning",
-      `Order reversed by admin · ${order.ref} · ${order.carrier} ${order.gb}GB · ₵${credit} returned`,
+      `Order reversed by admin · ${order.ref} · ${order.carrier} ${order.gb}GB · ₵${agentAdjustment} returned`,
       "admin/orders"
     );
     res.json({

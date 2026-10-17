@@ -203,6 +203,17 @@ export async function netpluseWalletBalance() {
   };
 }
 
+// A request/phone throttle describes a temporary provider limit, not a final
+// delivery failure. Netpluse can report it in a 2xx body with status "failed".
+export const isProviderThrottle = (message) =>
+  /too many (?:recent )?(?:orders|requests)|rate[\s_-]*limit/i.test(String(message));
+
+const hasConflictingFailure = (data) => {
+  if (!data?.providerStatus) return false;
+  const failed = (status) => ["failed", "refunded"].includes(mapProviderStatus(status));
+  return failed(data.status) !== failed(data.providerStatus);
+};
+
 /** Buy data. This is the only function in this module that can spend provider funds. */
 export async function netpluseBuyData({ ref, phone, carrier, gb }) {
   const match = await resolveProviderBundle(carrier, gb);
@@ -220,8 +231,19 @@ export async function netpluseBuyData({ ref, phone, carrier, gb }) {
     }),
   });
 
-  const message = json?.error || json?.message || "";
-  if (!ok && (transportError || status === 409)) {
+  const data = json?.data || json;
+  const message = String(json?.error || json?.message || data?.message || data?.error || "");
+  const throttled = isProviderThrottle(`${message} ${data?.message || ""} ${data?.error || ""}`);
+  const providerStatus = mapProviderStatus(data?.status || "processing");
+  // Only explicit validation/auth/funds rejections prove the POST was refused.
+  // Timeouts, duplicate-key conflicts, rate limits and server errors may arrive
+  // after acceptance, so keep the debit until a status lookup settles delivery.
+  const definiteRejection = [400, 401, 402, 403, 404, 422].includes(status);
+  if (
+    (!ok && (transportError || !definiteRejection)) ||
+    (throttled && (!ok || ["failed", "refunded"].includes(providerStatus))) ||
+    hasConflictingFailure(data)
+  ) {
     return {
       ok: false,
       indeterminate: true,
@@ -231,12 +253,11 @@ export async function netpluseBuyData({ ref, phone, carrier, gb }) {
     };
   }
 
-  const data = json?.data || json;
   return {
     ok,
     message,
     providerRef: String(data?.reference || ""),
-    status: ok ? mapProviderStatus(data?.status || "processing") : "failed",
+    status: ok ? providerStatus : "failed",
     raw: String(data?.status || "processing"),
     cost: Number(data?.price) || match.cost,
     balance: data?.balance == null ? null : Number(data.balance),
@@ -244,21 +265,31 @@ export async function netpluseBuyData({ ref, phone, carrier, gb }) {
 }
 
 export async function netpluseOrderStatus(providerRef) {
-  const { ok, json } = await netpluse(
+  const { ok, status, json } = await netpluse(
     `/order-status/${encodeURIComponent(providerRef)}`
   );
+  const data = json?.data || json;
+  const message = String(json?.error || json?.message || data?.message || data?.error || "");
+  const raw = String(data?.status || "processing");
+  const providerStatus = mapProviderStatus(raw);
+  if (hasConflictingFailure(data)) {
+    return { ok: false, indeterminate: true, message: "Netpluse returned conflicting delivery states; awaiting confirmation." };
+  }
+  const throttled = isProviderThrottle(`${message} ${data?.message || ""} ${data?.error || ""}`);
+  if (throttled && (!ok || ["failed", "refunded"].includes(providerStatus))) {
+    return { ok: false, indeterminate: true, message };
+  }
   if (!ok) {
     return {
       ok: false,
-      message: json?.error || json?.message || "Could not read the Netpluse order status.",
+      ...(status === 404 ? { notFound: true } : {}),
+      message: message || "Could not read the Netpluse order status.",
     };
   }
-  const data = json?.data || json;
-  const raw = String(data?.status || "processing");
   return {
     ok: true,
     providerRef: String(data?.reference || providerRef),
-    status: mapProviderStatus(raw),
+    status: providerStatus,
     raw,
     network: String(data?.network || ""),
     capacity: String(data?.capacity || ""),

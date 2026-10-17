@@ -271,7 +271,9 @@ router.post("/spend", async (req, res, next) => {
           .replace(/[.\s]+$/, "")
           .trim() || "the provider rejected it";
       return res.status(502).json({
-        error: `We couldn't deliver that bundle: ${reason}. Your wallet has been refunded.`,
+        error: `We couldn't confirm delivery of that bundle: ${reason}. ${settledOrder.reversedAt
+          ? "Your wallet has been refunded."
+          : "A wallet refund has not been confirmed. Check this order's status before buying again."}`,
         data: { agent: publicAgent(settledAgent || booked.agent) },
       });
     }

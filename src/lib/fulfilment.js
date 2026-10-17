@@ -18,11 +18,34 @@ import {
   netpluseLive,
   netpluseOrderStatus,
   netpluseSimulatedSalesAllowed,
+  isProviderThrottle,
   validPhone,
 } from "./netpluseApi.js";
 
 const money = (n) => Math.round(Number(n) * 100) / 100;
 const inFlightStatuses = ["processing", "on_hold"];
+
+// A status request holds a snapshot while waiting on the provider. It may write
+// only while the saved order is still in flight and has not been reversed.
+async function updateInFlightOrder(order, values) {
+  return Order.findOneAndUpdate(
+    { _id: order._id, status: { $in: inFlightStatuses }, reversedAt: null },
+    { $set: values },
+    { new: true }
+  );
+}
+
+async function savedOrderResult(order) {
+  const saved = await Order.findById(order._id);
+  return { status: saved?.status || order.status, message: saved?.providerMessage || "" };
+}
+
+export function canReverseOrder(order) {
+  return (
+    ["failed", "cancelled"].includes(order.status) ||
+    (order.status === "completed" && order.provider === "simulated" && !order.earningsSettledAt)
+  );
+}
 
 /**
  * Release platform-collected order earnings only after confirmed delivery.
@@ -186,12 +209,13 @@ export async function fulfilOrder(inputOrder, reversal) {
           : "The fulfilment provider is not configured, so this bundle was not sent."
       );
     }
-    order.provider = "simulated";
-    order.providerStatus = "simulated";
-    order.providerMessage = "Simulated sale. Nothing was sent.";
-    order.status = "completed";
-    order.deliveredAt = new Date();
-    await order.save();
+    const completed = await updateInFlightOrder(order, {
+      provider: "simulated", providerStatus: "simulated",
+      providerMessage: "Simulated sale. Nothing was sent.",
+      status: "completed", deliveredAt: new Date(),
+    });
+    if (!completed) return savedOrderResult(order);
+    order = completed;
     await settleCompletedOrderEarnings(order);
     await markPaymentFulfilled(order);
     return { status: order.status, simulated: true };
@@ -208,13 +232,14 @@ export async function fulfilOrder(inputOrder, reversal) {
     gb: order.gb,
   });
 
-  // POST timeouts are ambiguous. Netpluse may have accepted and charged the order,
+  // POST timeouts/rate limits are ambiguous. Netpluse may have charged the order,
   // so never refund or send a duplicate until its client reference is found.
   if (result.indeterminate) {
-    order.providerStatus = "unknown";
-    order.providerMessage = result.message;
-    order.status = "processing";
-    await order.save();
+    const waiting = await updateInFlightOrder(order, {
+      providerStatus: "unknown", providerMessage: result.message, status: "processing",
+    });
+    if (!waiting) return savedOrderResult(order);
+    order = waiting;
     recordLog(
       "warning",
       `Netpluse purchase outcome unknown · ${order.ref} · awaiting reconciliation`,
@@ -227,60 +252,89 @@ export async function fulfilOrder(inputOrder, reversal) {
     return settleFailed(order, result.message || "The provider rejected this order.");
   }
 
-  order.provider = "netpluse";
-  order.providerRef = result.providerRef;
-  order.providerStatus = result.raw || result.status;
-  order.providerMessage = result.message;
-  order.providerCost = money(result.cost || 0);
-  order.status = result.status;
-  if (result.status === "completed") order.deliveredAt = new Date();
-  await order.save();
+  const provider = {
+    provider: "netpluse", providerRef: result.providerRef,
+    providerStatus: result.raw || result.status, providerMessage: result.message,
+    providerCost: money(result.cost || 0),
+  };
+  if (!["completed", ...inFlightStatuses].includes(result.status)) {
+    return settleFailed(order, result.message || "The provider could not deliver this order.", provider);
+  }
+  const updated = await updateInFlightOrder(order, {
+    ...provider, status: result.status,
+    ...(result.status === "completed" ? { deliveredAt: new Date() } : {}),
+  });
+  if (!updated) return savedOrderResult(order);
+  order = updated;
 
   if (result.status === "completed") {
     await settleCompletedOrderEarnings(order);
     await markPaymentFulfilled(order);
   }
-  if (result.status === "completed" || inFlightStatuses.includes(result.status)) {
-    recordLog(
-      "info",
-      `Order sent to Netpluse · ${order.ref} · ${order.carrier} ${order.gb}GB → ${order.phone}`,
-      "fulfilment",
-      { providerRef: order.providerRef, cost: order.providerCost }
-    );
-    return { status: order.status };
-  }
-
-  return settleFailed(order, result.message || "The provider could not deliver this order.");
+  recordLog(
+    "info",
+    `Order sent to Netpluse · ${order.ref} · ${order.carrier} ${order.gb}GB → ${order.phone}`,
+    "fulfilment",
+    { providerRef: order.providerRef, cost: order.providerCost }
+  );
+  return { status: order.status };
 }
 
 async function markPaymentFulfilled(order) {
   if (!order.paymentReference) return;
   await Payment.updateOne(
-    { reference: order.paymentReference, status: { $nin: ["refund_pending", "refunded"] } },
+    { reference: order.paymentReference, status: { $nin: ["refund_pending", "refund_failed", "refunded"] } },
     { $set: { status: "fulfilled" } }
   );
 }
 
-async function settleFailed(order, message) {
-  order.provider = order.provider || "netpluse";
-  order.providerStatus = "failed";
-  order.providerMessage = message;
-  order.status = "failed";
-  await order.save();
-
-  const reversed = await reverseOrder(order);
+async function settleFailed(order, message, provider = {}) {
+  const failed = await updateInFlightOrder(order, {
+    provider: order.provider || "netpluse", providerStatus: "failed", ...provider,
+    providerMessage: message, status: "failed",
+  });
+  if (!failed) return savedOrderResult(order);
+  const reversed = await reverseOrder(failed);
+  const saved = await savedOrderResult(failed);
   recordLog(
     "warning",
-    `Order not delivered · ${order.ref} · ${order.carrier} ${order.gb}GB · ${message}`,
+    `Order failure reconciled · ${order.ref} · ${order.carrier} ${order.gb}GB · ${saved.status} · ${message}`,
     "fulfilment",
-    { reversed }
+    { reversed, status: saved.status }
   );
-  return { status: reversed ? "refunded" : order.status, message };
+  return { status: saved.status, message: saved.message || message };
 }
 
 /** Atomically undo internal accounting once, then queue any gateway refund. */
 export async function reverseOrder(inputOrder) {
-  if (inputOrder.reversedAt || !inputOrder.reversal?.agent) return false;
+  if (inputOrder.reversedAt || !inputOrder.reversal?.agent || !canReverseOrder(inputOrder)) return false;
+
+  // Verify accepted orders again before moving money. This also recovers old
+  // failed records caused by temporary throttles, before a refund is booked.
+  if (
+    inputOrder.status === "failed" && inputOrder.provider === "netpluse" &&
+    (inputOrder.providerRef || isProviderThrottle(inputOrder.providerMessage))
+  ) {
+    const live = await netpluseOrderStatus(inputOrder.providerRef || inputOrder.ref);
+    if (!live.ok) return false;
+    if (!["failed", "refunded"].includes(live.status)) {
+      const recovered = await Order.findOneAndUpdate(
+        { _id: inputOrder._id, status: "failed", reversedAt: null },
+        { $set: {
+          status: live.status, providerRef: inputOrder.providerRef || live.providerRef,
+          providerStatus: live.raw || live.status,
+          providerMessage: live.message || "Netpluse is still processing this order; no refund was issued.",
+          ...(live.status === "completed" ? { deliveredAt: inputOrder.deliveredAt || new Date() } : {}),
+        } },
+        { new: true }
+      );
+      if (recovered?.status === "completed") {
+        await settleCompletedOrderEarnings(recovered);
+        await markPaymentFulfilled(recovered);
+      }
+      return false;
+    }
+  }
 
   // A user cancellation has its own terminal state. Provider failures still
   // settle as refunded, while a cancelled order remains visibly cancelled
@@ -291,6 +345,8 @@ export async function reverseOrder(inputOrder) {
     const order = await Order.findOneAndUpdate(
       {
         _id: inputOrder._id,
+        status: inputOrder.status,
+        ...(inputOrder.status === "completed" ? { provider: "simulated", earningsSettledAt: null } : {}),
         $or: [{ reversedAt: { $exists: false } }, { reversedAt: null }],
       },
       { $set: { status: reversedStatus, reversedAt: new Date() } },
@@ -313,6 +369,7 @@ export async function reverseOrder(inputOrder) {
         { $inc: { wallet: agentAdjustment } },
         { new: true, session }
       );
+      if (!agent) throw new Error(`Cannot refund ${order.ref}: buyer account not found.`);
       if (agent) {
         await Transaction.create(
           [
@@ -335,6 +392,7 @@ export async function reverseOrder(inputOrder) {
       const superadmin = await Agent.findOne({ role: "superadmin" })
         .sort({ createdAt: 1 })
         .session(session);
+      if (!superadmin) throw new Error(`Cannot reverse ${order.ref}: platform account not found.`);
       if (superadmin) {
         await Agent.updateOne(
           { _id: superadmin._id },
@@ -434,33 +492,45 @@ export async function syncNetpluseOrder(inputOrder) {
     };
   }
 
-  const retryingPurchase = !order.providerRef;
-  const result = order.providerRef
-    ? await netpluseOrderStatus(order.providerRef)
-    : await netpluseBuyData({
-        ref: order.ref,
-        phone: order.phone,
-        carrier: order.carrier,
-        gb: order.gb,
-      });
+  // An accepted POST can lose its response before we save the provider reference.
+  // Look up our original idempotency reference first; a missing local reference
+  // is never proof that we should send another purchase request.
+  let result = await netpluseOrderStatus(order.providerRef || order.ref);
+  if (
+    result.notFound &&
+    !order.providerRef &&
+    inFlightStatuses.includes(order.status) &&
+    netpluseLive()
+  ) {
+    result = await netpluseBuyData({
+      ref: order.ref,
+      phone: order.phone,
+      carrier: order.carrier,
+      gb: order.gb,
+    });
+  }
 
   if (!result.ok) {
-    if (inFlightStatuses.includes(order.status) && retryingPurchase && !result.indeterminate) {
-      order.providerMessage = result.message || "Netpluse rejected the retried order.";
-      await settleFailed(order, order.providerMessage);
-    }
+    // Even a rejected retry cannot prove the original timed-out POST failed.
+    // Keep checking its reference; only a confirmed order status can refund it.
+    await updateInFlightOrder(order, {
+      providerMessage: result.message || "Could not read the live Netpluse order status.",
+    });
+    const saved = await savedOrderResult(order);
     return {
       checked: true,
       ok: false,
-      status: order.status,
+      status: saved.status,
       message: result.message || "Could not read the live Netpluse order status.",
     };
   }
 
-  if (result.providerRef && !order.providerRef) order.providerRef = result.providerRef;
-  order.providerStatus = result.raw || result.status;
-  order.providerMessage = result.message || order.providerMessage;
-  order.providerCost = money(result.cost || order.providerCost || 0);
+  const provider = {
+    providerRef: order.providerRef || result.providerRef,
+    providerStatus: result.raw || result.status,
+    providerMessage: result.message || order.providerMessage,
+    providerCost: money(result.cost || order.providerCost || 0),
+  };
   const liveOrder = {
     network: result.network || order.carrier || "",
     capacity: result.capacity || order.bundle || "",
@@ -470,7 +540,6 @@ export async function syncNetpluseOrder(inputOrder) {
   // Terminal local orders are queried for visibility, but never reversed or
   // reopened by a later provider response. Only in-flight orders reconcile.
   if (!inFlightStatuses.includes(order.status)) {
-    await order.save();
     return {
       checked: true,
       ok: true,
@@ -483,8 +552,9 @@ export async function syncNetpluseOrder(inputOrder) {
   }
 
   if (inFlightStatuses.includes(result.status)) {
-    order.status = result.status;
-    await order.save();
+    const updated = await updateInFlightOrder(order, { ...provider, status: result.status });
+    if (!updated) return { checked: true, ok: true, ...await savedOrderResult(order) };
+    order = updated;
     return {
       checked: true,
       ok: true,
@@ -499,9 +569,11 @@ export async function syncNetpluseOrder(inputOrder) {
   }
 
   if (result.status === "completed") {
-    order.status = "completed";
-    order.deliveredAt = order.deliveredAt || new Date();
-    await order.save();
+    const updated = await updateInFlightOrder(order, {
+      ...provider, status: "completed", deliveredAt: order.deliveredAt || new Date(),
+    });
+    if (!updated) return { checked: true, ok: true, ...await savedOrderResult(order) };
+    order = updated;
     await settleCompletedOrderEarnings(order);
     await markPaymentFulfilled(order);
     return {
@@ -515,16 +587,14 @@ export async function syncNetpluseOrder(inputOrder) {
     };
   }
 
-  order.providerMessage = result.message || `Provider reported ${result.raw || "failed"}.`;
-  await settleFailed(order, order.providerMessage);
-  const settled = await Order.findById(order._id).lean();
+  const failure = await settleFailed(order, result.message || `Provider reported ${result.raw || "failed"}.`, provider);
   return {
     checked: true,
     ok: true,
-    status: settled?.status || "failed",
+    status: failure.status,
     raw: result.raw || result.status,
-    message: order.providerMessage,
-    providerRef: order.providerRef,
+    message: failure.message,
+    providerRef: provider.providerRef,
     ...liveOrder,
   };
 }

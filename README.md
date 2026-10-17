@@ -252,6 +252,18 @@ agent orders view and the superadmin **All Orders** page. They remain in the
 polling queue until delivery resumes or the provider confirms failure; a hold
 does not trigger a refund or settle delivery earnings.
 
+Refund recovery checks the original order reference before retrying a purchase.
+Timeouts, rate limits, server errors, conflicting provider states, and rejected
+retries remain unresolved until delivery can be confirmed. For an accepted
+order, a fresh failed/refunded provider status is required before reversing its
+wallet debit and margin. Pending orders can be cancelled before dispatch;
+processing and held orders cannot be refunded through the admin reversal API.
+Conditional status updates prevent delayed responses from reopening terminal
+orders, and the transactional reversal claim prevents duplicate refunds.
+
+These changes take effect after redeploying or restarting the backend with the
+updated source. Run `npm test` in `backend` to verify the refund regression tests.
+
 Three things worth knowing:
 
 - **The configured key is live.** `NETPLUSE_FULFILMENT=auto` sends upstream only

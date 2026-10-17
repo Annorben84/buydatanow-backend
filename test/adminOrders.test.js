@@ -144,3 +144,20 @@ test("ordinary agents and unauthenticated requests cannot read platform orders",
   assert.equal((await state.get("", null)).status, 401);
   assert.equal(state.reads, 0);
 });
+
+test("admin reversal cannot refund processing, held, pending or delivered orders", async (t) => {
+  const handler = router.stack.find((layer) => layer.route?.path === "/orders/:ref/reverse").route.stack[0].handle;
+  const mutation = t.mock.method(Order, "findOneAndUpdate", async () => { throw new Error("Must not claim a refund"); });
+  for (const status of ["processing", "on_hold", "pending", "completed"]) {
+    t.mock.method(Order, "findOne", async () => ({
+      ref: "DP-active", status, provider: "netpluse", reversal: { agent: "ama" },
+    }));
+    let statusCode;
+    let response;
+    const res = { status: (code) => { statusCode = code; return res; }, json: (body) => { response = body; } };
+    await handler({ params: { ref: "DP-active" } }, res, (error) => { throw error; });
+    assert.equal(statusCode, 409);
+    assert.ok(response.error);
+  }
+  assert.equal(mutation.mock.callCount(), 0);
+});
