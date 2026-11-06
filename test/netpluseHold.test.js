@@ -6,7 +6,7 @@ process.env.NETPLUSE_API_KEY = "np_test_hold";
 process.env.NETPLUSE_FULFILMENT = "on";
 const { Agent, Bundle, Customer, Log, Order, Payment, Transaction } = await import("../src/models/index.js");
 const { mapProviderStatus } = await import("../src/lib/netpluseApi.js");
-const { fulfilOrder, reverseOrder, syncNetpluseOrder, syncPendingOrders } = await import("../src/lib/fulfilment.js");
+const { completeOrderManually, fulfilOrder, reverseOrder, settleCompletedOrderEarnings, syncNetpluseOrder, syncPendingOrders } = await import("../src/lib/fulfilment.js");
 const { default: walletRouter } = await import("../src/walletRoutes.js");
 
 function query(value) {
@@ -44,6 +44,7 @@ function fixture(t, status = "processing") {
     return query({ ...state.order });
   });
   t.mock.method(Order, "findById", () => query(state.order));
+  t.mock.method(Order, "findOne", ({ ref }) => query(ref === state.order.ref ? { ...state.order } : null));
   t.mock.method(Order, "find", (filter) => {
     state.queries.push(filter);
     return query(filter.provider === "netpluse" && filter.status.$in.includes(state.order.status) ? [state.order] : []);
@@ -69,7 +70,7 @@ function fixture(t, status = "processing") {
     if (options.body) request.reference = JSON.parse(options.body).reference;
     state.requests.push(request);
     if (path.includes("/order-status/")) {
-      state.beforeLookupResponse?.();
+      await state.beforeLookupResponse?.();
       if (state.lookupResponse) return state.lookupResponse;
     }
     if (path.endsWith("/purchase")) {
@@ -128,6 +129,93 @@ test("processing orders move onto hold, resume, and settle delivery earnings onc
   assert.equal(state.admin.wallet, 20.5);
   assert.equal(state.payment.status, "fulfilled");
   assert.equal(state.ledger.length, 2);
+});
+
+test("Netpluse delivery after manual completion cannot credit commission again", async (t) => {
+  for (const status of ["processing", "on_hold"]) {
+    await t.test(status, async (t) => {
+      const state = fixture(t, status);
+      const stale = { ...state.order };
+      await completeOrderManually(state.order.ref, state.admin._id);
+      const settledAt = state.order.earningsSettledAt;
+      state.upstreamStatus = "delivered";
+
+      await syncNetpluseOrder({ ...state.order });
+      await syncNetpluseOrder(stale);
+      await syncNetpluseOrder({ ...stale });
+      assert.equal((await syncPendingOrders()).checked, 0);
+
+      assert.equal(state.order.status, "completed");
+      assert.equal(state.order.earningsSettledAt, settledAt);
+      assert.equal(state.order.manuallyCompletedBy, state.admin._id);
+      assert.equal(state.agent.commissionAvailable, 1);
+      assert.equal(state.agent.wallet, 10);
+      assert.equal(state.admin.wallet, 20.5);
+      assert.equal(state.payment.status, "fulfilled");
+      assert.deepEqual(state.ledger.map((row) => row.reference), ["DP-held-margin", "DP-held-platform"]);
+      assert.ok(state.requests.every((request) => request.method === "GET"));
+    });
+  }
+});
+
+test("manual completion after Netpluse delivery cannot credit commission again", async (t) => {
+  const state = fixture(t);
+  state.upstreamStatus = "delivered";
+  await syncNetpluseOrder({ ...state.order });
+  const settledAt = state.order.earningsSettledAt;
+  const result = await completeOrderManually(state.order.ref, state.admin._id);
+  await syncNetpluseOrder({ ...state.order });
+  assert.equal(result.alreadyCompleted, true);
+  assert.equal(result.earningsSettled, false);
+  assert.equal(state.order.earningsSettledAt, settledAt);
+  assert.equal(state.agent.commissionAvailable, 1);
+  assert.equal(state.admin.wallet, 20.5);
+  assert.equal(state.ledger.filter((row) => row.reference === "DP-held-margin").length, 1);
+});
+
+test("a Netpluse delivery response arriving during manual completion cannot double-credit", async (t) => {
+  const state = fixture(t);
+  state.upstreamStatus = "delivered";
+  state.beforeLookupResponse = async () => {
+    await completeOrderManually(state.order.ref, state.admin._id);
+  };
+  const result = await syncNetpluseOrder({ ...state.order });
+  assert.equal(result.status, "completed");
+  assert.equal(state.agent.commissionAvailable, 1);
+  assert.equal(state.admin.wallet, 20.5);
+  assert.deepEqual(state.ledger.map((row) => row.reference), ["DP-held-margin", "DP-held-platform"]);
+});
+
+test("manual settlement between Netpluse completion and earnings settlement wins only once", async (t) => {
+  const state = fixture(t);
+  state.upstreamStatus = "delivered";
+  const updateOrder = Order.findOneAndUpdate;
+  t.mock.method(Order, "findOneAndUpdate", async (filter, update, options) => {
+    const result = await updateOrder(filter, update, options);
+    if (update.$set.status === "completed" && !options?.session) {
+      assert.equal((await completeOrderManually(state.order.ref, state.admin._id)).earningsSettled, true);
+    }
+    return result;
+  });
+  await syncNetpluseOrder({ ...state.order });
+  assert.equal(state.order.status, "completed");
+  assert.equal(state.agent.commissionAvailable, 1);
+  assert.equal(state.admin.wallet, 20.5);
+  assert.deepEqual(state.ledger.map((row) => row.reference), ["DP-held-margin", "DP-held-platform"]);
+});
+
+test("stale earnings snapshots cannot bypass the stored settlement claim", async (t) => {
+  const state = fixture(t);
+  const stale = { ...state.order, status: "completed" };
+  await completeOrderManually(state.order.ref, state.admin._id);
+  const results = await Promise.all([
+    settleCompletedOrderEarnings({ ...stale }),
+    settleCompletedOrderEarnings({ ...stale }),
+  ]);
+  assert.deepEqual(results, [false, false]);
+  assert.equal(state.agent.commissionAvailable, 1);
+  assert.equal(state.admin.wallet, 20.5);
+  assert.deepEqual(state.ledger.map((row) => row.reference), ["DP-held-margin", "DP-held-platform"]);
 });
 
 test("a held order that later fails is refunded once", async (t) => {

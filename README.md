@@ -151,6 +151,7 @@ It does not use real Paystack or Netpluse purchases.
 | GET | `/api/admin/provider/catalog` | What Netpluse sells us, at our cost price |
 | POST | `/api/admin/provider/sync-costs` | Pull Netpluse prices into `Bundle.cost` (`{"dryRun":true}` to preview) |
 | POST | `/api/admin/provider/sync-orders` | Settle orders still awaiting delivery |
+| POST | `/api/admin/orders/:ref/complete` | Superadmin confirms manual delivery and releases eligible commission once |
 
 All responses are `{ "data": ... }`. Errors are `{ "error": "..." }`.
 
@@ -187,6 +188,13 @@ Storefront commission is released to the agent only after delivery. Portal
 purchases do not create agent commission. Payment records retain
 `verificationMode` and `settlementModel`, keeping gateway-verified MoMo and
 legacy agent-confirmed transfers on the same accounting model.
+
+Superadmins can use **All Orders → Mark completed** after confirming that the
+customer received the data. Pending, processing, and held orders can be completed
+manually. Completion and eligible earnings settle in one MongoDB transaction;
+retries cannot credit commission twice. Failed, cancelled, reversed, refunding,
+and unconfirmed-payment orders are rejected. The order records who completed it
+and when, and the action appears in Platform Logs.
 
 ## Deploying
 

@@ -49,9 +49,10 @@ export function canReverseOrder(order) {
 
 /**
  * Release platform-collected order earnings only after confirmed delivery.
- * The order claim makes this safe across callbacks, polling, and retries.
+ * Manual completion and Netpluse delivery share this transactional claim, so
+ * delayed responses and retries cannot credit the same commission twice.
  */
-export async function settleCompletedOrderEarnings(inputOrder) {
+export async function settleCompletedOrderEarnings(inputOrder, existingSession) {
   if (
     inputOrder.status !== "completed" ||
     inputOrder.settlementModel !== "platform_collected" ||
@@ -60,7 +61,7 @@ export async function settleCompletedOrderEarnings(inputOrder) {
     return false;
   }
 
-  return withMongoTransaction(async (session) => {
+  const settle = async (session) => {
     const order = await Order.findOneAndUpdate(
       {
         _id: inputOrder._id,
@@ -161,6 +162,47 @@ export async function settleCompletedOrderEarnings(inputOrder) {
 
     if (rows.length) await Transaction.create(rows, { session, ordered: true });
     return true;
+  };
+  return existingSession ? settle(existingSession) : withMongoTransaction(settle);
+}
+
+/** Confirm manual delivery and release earnings together, without dispatching again. */
+export async function completeOrderManually(ref, adminId) {
+  return withMongoTransaction(async (session) => {
+    let order = await Order.findOne({ ref }).session(session);
+    if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+    if (
+      !["pending", ...inFlightStatuses, "completed"].includes(order.status) ||
+      order.reversedAt || order.refund?.status
+    ) {
+      throw Object.assign(new Error("This order cannot be marked as completed because it has failed, been cancelled, or entered a refund."), { status: 409 });
+    }
+
+    if (order.paymentReference) {
+      const payment = await Payment.findOne({ reference: order.paymentReference }).session(session);
+      if (!payment || !["succeeded", "fulfilling", "fulfilled"].includes(payment.status)) {
+        throw Object.assign(new Error("The order's payment must be confirmed and must not be under refund before completing it."), { status: 409 });
+      }
+    }
+
+    const alreadyCompleted = order.status === "completed";
+    if (!alreadyCompleted) {
+      order = await Order.findOneAndUpdate(
+        { _id: order._id, status: order.status, reversedAt: null, "refund.status": { $in: ["", null] } },
+        { $set: {
+          status: "completed", deliveredAt: new Date(),
+          manuallyCompletedAt: new Date(), manuallyCompletedBy: adminId,
+        } },
+        { new: true, session }
+      );
+      if (!order) {
+        throw Object.assign(new Error("The order changed. Refresh the orders and try again."), { status: 409 });
+      }
+    }
+
+    const earningsSettled = await settleCompletedOrderEarnings(order, session);
+    await markPaymentFulfilled(order, session);
+    return { ref: order.ref, status: order.status, deliveredAt: order.deliveredAt, alreadyCompleted, earningsSettled };
   });
 }
 
@@ -280,11 +322,12 @@ export async function fulfilOrder(inputOrder, reversal) {
   return { status: order.status };
 }
 
-async function markPaymentFulfilled(order) {
+async function markPaymentFulfilled(order, session) {
   if (!order.paymentReference) return;
   await Payment.updateOne(
     { reference: order.paymentReference, status: { $nin: ["refund_pending", "refund_failed", "refunded"] } },
-    { $set: { status: "fulfilled" } }
+    { $set: { status: "fulfilled" } },
+    session ? { session } : {}
   );
 }
 

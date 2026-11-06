@@ -33,6 +33,8 @@ const OrderSchema = new Schema(
     providerMessage: { type: String, default: "" },
     providerCost: { type: Number, default: 0 }, // what the provider charged us
     deliveredAt: { type: Date },
+    manuallyCompletedAt: { type: Date },
+    manuallyCompletedBy: { type: Schema.Types.ObjectId, ref: "Agent" },
 
     // The gateway payment behind a public storefront or authenticated portal order.
     paymentProvider: { type: String, default: "" },

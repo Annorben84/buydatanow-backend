@@ -21,7 +21,7 @@ import { withMongoTransaction } from "./lib/mongoTransaction.js";
 import { notifyPriceChange } from "./lib/priceNotifications.js";
 import { providerCostChange, syncBundleCost } from "./lib/bundleCostSync.js";
 import { syncPendingCheckerPurchases } from "./lib/checkerPurchases.js";
-import { syncPendingOrders, reverseOrder, canReverseOrder } from "./lib/fulfilment.js";
+import { syncPendingOrders, reverseOrder, canReverseOrder, completeOrderManually } from "./lib/fulfilment.js";
 import { requestPaystackRefundForOrder } from "./lib/paystackRefund.js";
 import { creditAgentWallet, validateAdminCredit } from "./lib/adminCredit.js";
 import {
@@ -443,6 +443,21 @@ router.get("/orders", async (req, res, next) => {
       agentEmail: order.agent?.email || "",
     }));
     res.json({ data: { items, total, page, pageSize } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Superadmins confirm delivery and release the order's existing commission. */
+router.post("/orders/:ref/complete", async (req, res, next) => {
+  try {
+    const result = await completeOrderManually(req.params.ref, req.agent._id);
+    if (!result.alreadyCompleted || result.earningsSettled) {
+      recordLog("info", `Order completed manually by ${req.agent.name} · ${result.ref}`, "admin/orders", {
+        adminId: String(req.agent._id), ref: result.ref, earningsSettled: result.earningsSettled,
+      });
+    }
+    res.json({ data: result });
   } catch (err) {
     next(err);
   }
