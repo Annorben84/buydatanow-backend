@@ -478,6 +478,7 @@ router.get("/transactions", async (req, res, next) => {
  * platform totals, 7-day volume, sales by carrier, top agents, recent ledger.
  */
 router.get("/overview", async (req, res, next) => {
+  res.set("Cache-Control", "no-store");
   try {
     const dayMs = 24 * 60 * 60 * 1000;
     const startToday = new Date();
